@@ -217,12 +217,28 @@ def save_data(args, timesteps, actions, dataset_path):
             root.create_dataset('language_raw', data=[args.language_raw])
 
         for cam_name in args.camera_names:
-            image.create_dataset(cam_name, (data_size, 480, 640, 3), dtype='uint8', chunks=(1, 480, 640, 3))
+            rgb_key = f'/observations/images/{cam_name}'
+            rgb_sample = np.asarray(data_dict[rgb_key][0])
+            rgb_shape = tuple(rgb_sample.shape)
+            image.create_dataset(
+                cam_name,
+                (data_size, *rgb_shape),
+                dtype=rgb_sample.dtype,
+                chunks=(1, *rgb_shape),
+            )
 
         if args.use_depth_image:
             image_depth = obs.create_group('images_depth')
             for cam_name in args.camera_names:
-                image_depth.create_dataset(cam_name, (data_size, 480, 640), dtype='uint16', chunks=(1, 480, 640))
+                depth_key = f'/observations/images_depth/{cam_name}'
+                depth_sample = np.asarray(data_dict[depth_key][0])
+                depth_shape = tuple(depth_sample.shape)
+                image_depth.create_dataset(
+                    cam_name,
+                    (data_size, *depth_shape),
+                    dtype=depth_sample.dtype,
+                    chunks=(1, *depth_shape),
+                )
 
         obs.create_dataset('qpos', (data_size, qpos_dim))
         obs.create_dataset('qvel', (data_size, qvel_dim))
@@ -258,7 +274,7 @@ def save_data(args, timesteps, actions, dataset_path):
         arm.create_dataset('arm_status_right', (data_size, 19), dtype='int64')
 
         for name, array in data_dict.items():
-            root[name][...] = array
+            root[name][...] = np.asarray(array)
 
     print(f'\033[32m\nSaving: {time.time() - t0:.1f} secs. {dataset_path} \033[0m\n')
 
