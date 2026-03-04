@@ -6,6 +6,8 @@
 
 该脚本在 ROS2（`rclpy`）环境下同步采集多路传感器与机械臂状态，最终写入单个 `HDF5` 数据文件：
 
+运行环境：ROS2 Humble（已按 Humble 常用 QoS 与 `rclpy` API 适配）。
+
 - 输出路径：`{dataset_dir}/{task_name}/episode_{episode_idx}.hdf5`
 - 典型数据内容：
 1. 彩色图像（默认 3 路：`top/left/right`）
@@ -202,6 +204,7 @@
 ## 10. 最小使用示例
 
 ```bash
+source /opt/ros/humble/setup.bash
 python collect_data/collect_data_four_camera.py \
   --dataset_dir ./data \
   --task_name pick_place \

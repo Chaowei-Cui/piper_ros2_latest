@@ -12,7 +12,7 @@ from pynput import keyboard
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import QoSProfile, SensorDataQoS
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import JointState
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
@@ -187,7 +187,7 @@ class RosOperator(Node):
         super().__init__('record_episodes')
         self.args = args
         self.bridge = CvBridge()
-        self.qos_sensor = SensorDataQoS()
+        self.qos_sensor = qos_profile_sensor_data
         self.qos_reliable = QoSProfile(depth=MAX_DEQUE)
         self.subscribers = []
         self.arm_status_fields = [
