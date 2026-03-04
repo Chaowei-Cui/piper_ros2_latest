@@ -8,7 +8,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose
-from piper_msgs.msg import PiperStatusMsg
+from piper_msgs.msg import PiperStatusMsg, PosCmd
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Image, JointState
@@ -102,9 +102,13 @@ class Ros2Replayer(Node):
         self.pub_joint_states_right = self.create_publisher(JointState, args.joint_states_right_topic, default_qos)
         self.pub_joint_left = self.create_publisher(JointState, args.joint_left_topic, default_qos)
         self.pub_joint_right = self.create_publisher(JointState, args.joint_right_topic, default_qos)
+        self.pub_joint_ctrl_cmd_left = self.create_publisher(JointState, args.joint_ctrl_cmd_left_topic, default_qos)
+        self.pub_joint_ctrl_cmd_right = self.create_publisher(JointState, args.joint_ctrl_cmd_right_topic, default_qos)
 
         self.pub_end_pose_left = self.create_publisher(Pose, args.end_pose_left_topic, default_qos)
         self.pub_end_pose_right = self.create_publisher(Pose, args.end_pose_right_topic, default_qos)
+        self.pub_pos_cmd_left = self.create_publisher(PosCmd, args.pos_cmd_left_topic, default_qos)
+        self.pub_pos_cmd_right = self.create_publisher(PosCmd, args.pos_cmd_right_topic, default_qos)
 
         self.pub_arm_status_left = self.create_publisher(PiperStatusMsg, args.arm_status_left_topic, default_qos)
         self.pub_arm_status_right = self.create_publisher(PiperStatusMsg, args.arm_status_right_topic, default_qos)
@@ -152,6 +156,40 @@ class Ros2Replayer(Node):
         msg.communication_status_joint_4 = bool(vec19[16])
         msg.communication_status_joint_5 = bool(vec19[17])
         msg.communication_status_joint_6 = bool(vec19[18])
+        return msg
+
+    @staticmethod
+    def _quat_to_rpy(qx, qy, qz, qw):
+        # Quaternion (x, y, z, w) -> Euler (roll, pitch, yaw), radians.
+        sinr_cosp = 2.0 * (qw * qx + qy * qz)
+        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1.0:
+            pitch = np.pi / 2.0 * np.sign(sinp)
+        else:
+            pitch = np.arcsin(sinp)
+
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        return float(roll), float(pitch), float(yaw)
+
+    def _build_pos_cmd(self, pose_vec7, gripper, mode1, mode2):
+        msg = PosCmd()
+        msg.x = float(pose_vec7[0])
+        msg.y = float(pose_vec7[1])
+        msg.z = float(pose_vec7[2])
+        roll, pitch, yaw = self._quat_to_rpy(
+            float(pose_vec7[3]), float(pose_vec7[4]), float(pose_vec7[5]), float(pose_vec7[6])
+        )
+        msg.roll = roll
+        msg.pitch = pitch
+        msg.yaw = yaw
+        msg.gripper = float(gripper)
+        msg.mode1 = int(mode1)
+        msg.mode2 = int(mode2)
         return msg
 
     def replay(self, data):
@@ -208,12 +246,43 @@ class Ros2Replayer(Node):
                     data['joint_right']['effort'][i],
                 )
             )
+            # Replay control inputs for controller subscribers.
+            self.pub_joint_ctrl_cmd_left.publish(
+                self._build_joint_msg(
+                    data['joint_left']['position'][i],
+                    data['joint_left']['velocity'][i],
+                    data['joint_left']['effort'][i],
+                )
+            )
+            self.pub_joint_ctrl_cmd_right.publish(
+                self._build_joint_msg(
+                    data['joint_right']['position'][i],
+                    data['joint_right']['velocity'][i],
+                    data['joint_right']['effort'][i],
+                )
+            )
 
             # Publish end poses and arm status
             self.pub_end_pose_left.publish(self._build_pose_msg(data['end_pose_left'][i]))
             self.pub_end_pose_right.publish(self._build_pose_msg(data['end_pose_right'][i]))
             self.pub_arm_status_left.publish(self._build_status_msg(data['arm_status_left'][i]))
             self.pub_arm_status_right.publish(self._build_status_msg(data['arm_status_right'][i]))
+            self.pub_pos_cmd_left.publish(
+                self._build_pos_cmd(
+                    data['end_pose_left'][i],
+                    data['joint_left']['position'][i][6],
+                    self.args.pos_cmd_mode1,
+                    self.args.pos_cmd_mode2,
+                )
+            )
+            self.pub_pos_cmd_right.publish(
+                self._build_pos_cmd(
+                    data['end_pose_right'][i],
+                    data['joint_right']['position'][i][6],
+                    self.args.pos_cmd_mode1,
+                    self.args.pos_cmd_mode2,
+                )
+            )
 
             # Replay timing
             if self.args.use_saved_timestamps and data['timestamps'] is not None:
@@ -266,8 +335,14 @@ if __name__ == '__main__':
     parser.add_argument('--joint_states_right_topic', type=str, default='/joint_states_right')
     parser.add_argument('--joint_left_topic', type=str, default='/joint_left')
     parser.add_argument('--joint_right_topic', type=str, default='/joint_right')
+    parser.add_argument('--joint_ctrl_cmd_left_topic', type=str, default='/joint_ctrl_cmd_left')
+    parser.add_argument('--joint_ctrl_cmd_right_topic', type=str, default='/joint_ctrl_cmd_right')
     parser.add_argument('--end_pose_left_topic', type=str, default='/end_pose_left')
     parser.add_argument('--end_pose_right_topic', type=str, default='/end_pose_right')
+    parser.add_argument('--pos_cmd_left_topic', type=str, default='/pos_cmd_left')
+    parser.add_argument('--pos_cmd_right_topic', type=str, default='/pos_cmd_right')
+    parser.add_argument('--pos_cmd_mode1', type=int, default=0)
+    parser.add_argument('--pos_cmd_mode2', type=int, default=0)
     parser.add_argument('--arm_status_left_topic', type=str, default='/arm_status_left')
     parser.add_argument('--arm_status_right_topic', type=str, default='/arm_status_right')
 
