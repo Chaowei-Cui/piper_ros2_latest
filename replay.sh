@@ -4,7 +4,7 @@ set -euo pipefail
 
 DATASET_DIR="/home/agilex/data/sss"
 TASK_NAME="123"
-EPISODE_IDX=7
+EPISODE_IDX=18
 FRAME_RATE=30
 POS_CMD_MODE1=0
 POS_CMD_MODE2=0
