@@ -13,6 +13,8 @@ import rospy
 from sensor_msgs.msg import JointState
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose
+from piper_msgs.msg import PiperStatusMsg
 from cv_bridge import CvBridge
 import sys
 import cv2
@@ -85,6 +87,9 @@ def save_data(args, timesteps, actions, dataset_path):
         '/observations/effort': [],
         '/action': [],
         '/base_action': [],
+        '/observations/end_pose': [],
+        '/observations/arm_status': [],
+        '/observations/frame_timestamp': [],
         # '/base_action_t265': [],
         '/subtask': SUBTASK_FLAG[:data_size, :],
     }
@@ -107,6 +112,9 @@ def save_data(args, timesteps, actions, dataset_path):
         data_dict['/observations/qpos'].append(ts.observation['qpos'])
         data_dict['/observations/qvel'].append(ts.observation['qvel'])
         data_dict['/observations/effort'].append(ts.observation['effort'])
+        data_dict['/observations/end_pose'].append(ts.observation['end_pose'])
+        data_dict['/observations/arm_status'].append(ts.observation['arm_status'])
+        data_dict['/observations/frame_timestamp'].append(ts.observation['frame_timestamp'])
 
         # 实际发的action
         data_dict['/action'].append(action)
@@ -147,6 +155,9 @@ def save_data(args, timesteps, actions, dataset_path):
         _ = obs.create_dataset('qpos', (data_size, 14))
         _ = obs.create_dataset('qvel', (data_size, 14))
         _ = obs.create_dataset('effort', (data_size, 14))
+        _ = obs.create_dataset('end_pose', (data_size, 14))
+        _ = obs.create_dataset('arm_status', (data_size, 38), dtype='int64')
+        _ = obs.create_dataset('frame_timestamp', (data_size, 1))
         _ = root.create_dataset('action', (data_size, 14))
         _ = root.create_dataset('base_action', (data_size, 2))
         _ = root.create_dataset('subtask', (data_size, 1), dtype='uint8')
@@ -159,269 +170,212 @@ def save_data(args, timesteps, actions, dataset_path):
 
 class RosOperator:
     def __init__(self, args):
-        self.robot_base_deque = None
-        self.puppet_arm_right_deque = None
-        self.puppet_arm_left_deque = None
-        self.master_arm_right_deque = None
-        self.master_arm_left_deque = None
-        self.img_front_deque = None
-        self.img_right_deque = None
-        self.img_top_deque = None
-        self.img_left_deque = None
-        self.img_front_depth_deque = None
-        self.img_right_depth_deque = None
-        self.img_top_depth_deque = None
-        self.img_left_depth_deque = None
-        self.bridge = None
         self.args = args
-        self.init()
-        self.init_ros()
-
-    def init(self):
         self.bridge = CvBridge()
+        self.arm_status_fields = [
+            'ctrl_mode', 'arm_status', 'mode_feedback', 'teach_status', 'motion_status',
+            'trajectory_num', 'err_code', 'joint_1_angle_limit', 'joint_2_angle_limit',
+            'joint_3_angle_limit', 'joint_4_angle_limit', 'joint_5_angle_limit',
+            'joint_6_angle_limit', 'communication_status_joint_1',
+            'communication_status_joint_2', 'communication_status_joint_3',
+            'communication_status_joint_4', 'communication_status_joint_5',
+            'communication_status_joint_6'
+        ]
+
         self.img_left_deque = deque(maxlen=MAX_DEQUE)
         self.img_right_deque = deque(maxlen=MAX_DEQUE)
-        self.img_front_deque = deque(maxlen=MAX_DEQUE)
+        self.img_top_deque = deque(maxlen=MAX_DEQUE)
         self.img_left_depth_deque = deque(maxlen=MAX_DEQUE)
         self.img_right_depth_deque = deque(maxlen=MAX_DEQUE)
-        # self.img_front_depth_deque = deque(maxlen=MAX_DEQUE)
-        self.img_top_deque = deque(maxlen=MAX_DEQUE)
         self.img_top_depth_deque = deque(maxlen=MAX_DEQUE)
-        self.master_arm_left_deque = deque(maxlen=MAX_DEQUE)
-        self.master_arm_right_deque = deque(maxlen=MAX_DEQUE)
-        self.puppet_arm_left_deque = deque(maxlen=MAX_DEQUE)
 
-        self.puppet_arm_right_deque = deque(maxlen=MAX_DEQUE)
+        self.joint_states_left_deque = deque(maxlen=MAX_DEQUE)
+        self.joint_states_right_deque = deque(maxlen=MAX_DEQUE)
+        self.joint_left_deque = deque(maxlen=MAX_DEQUE)
+        self.joint_right_deque = deque(maxlen=MAX_DEQUE)
+        self.end_pose_left_deque = deque(maxlen=MAX_DEQUE)
+        self.end_pose_right_deque = deque(maxlen=MAX_DEQUE)
+        self.arm_status_left_deque = deque(maxlen=MAX_DEQUE)
+        self.arm_status_right_deque = deque(maxlen=MAX_DEQUE)
         self.robot_base_deque = deque(maxlen=MAX_DEQUE)
+        self.init_ros()
+
+    def _append_with_stamp(self, topic_deque, msg, use_now=False):
+        stamp = None
+        if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+            stamp = msg.header.stamp.to_sec()
+        if use_now or stamp is None or stamp <= 0:
+            stamp = rospy.Time.now().to_sec()
+        topic_deque.append((stamp, msg))
+
+    def _latest_stamp(self, topic_deque):
+        return topic_deque[-1][0]
+
+    def _pop_aligned_msg(self, topic_deque, frame_time):
+        while topic_deque and topic_deque[0][0] < frame_time:
+            topic_deque.popleft()
+        if not topic_deque:
+            return None
+        return topic_deque.popleft()[1]
+
+    def _normalize_joint_array(self, arr_like, target_len=7):
+        arr = np.asarray(arr_like, dtype=np.float64)
+        if arr.size >= target_len:
+            return arr[:target_len]
+        out = np.zeros(target_len, dtype=np.float64)
+        out[:arr.size] = arr
+        return out
+
+    def _pose_to_np(self, pose_msg):
+        return np.array([
+            pose_msg.position.x, pose_msg.position.y, pose_msg.position.z,
+            pose_msg.orientation.x, pose_msg.orientation.y,
+            pose_msg.orientation.z, pose_msg.orientation.w
+        ], dtype=np.float64)
+
+    def _arm_status_to_np(self, status_msg):
+        values = [int(getattr(status_msg, field)) for field in self.arm_status_fields]
+        return np.asarray(values, dtype=np.int64)
 
     def get_frame(self):
-
-        if len(self.img_left_deque) == 0 or len(self.img_right_deque) == 0 or len(self.img_top_deque) == 0 or \
-                (self.args.use_depth_image and (
-                        len(self.img_left_depth_deque) == 0 or len(self.img_right_depth_deque) == 0 or len(
-                    self.img_top_depth_deque) == 0)):
-            if len(self.img_left_deque) == 0:
-                print("left image deque")
-            if len(self.img_top_deque) == 0:
-                print("top image fisrt")
-            if len(self.img_right_deque) == 0:
-                print("right image deque")
-
-            return False
+        required_deques = [
+            self.img_left_deque, self.img_right_deque, self.img_top_deque,
+            self.joint_states_left_deque, self.joint_states_right_deque,
+            self.joint_left_deque, self.joint_right_deque,
+            self.end_pose_left_deque, self.end_pose_right_deque,
+            self.arm_status_left_deque, self.arm_status_right_deque
+        ]
         if self.args.use_depth_image:
-            frame_time = min(
-                [self.img_left_deque[-1].header.stamp.to_sec(), self.img_right_deque[-1].header.stamp.to_sec(),
-                 self.img_front_deque[-1].header.stamp.to_sec(),
-                 self.img_left_depth_deque[-1].header.stamp.to_sec(),
-                 self.img_right_depth_deque[-1].header.stamp.to_sec(),
-                 self.img_top_depth_deque[-1].header.stamp.to_sec()])
-        else:
-            frame_time = min(
-                [self.img_left_deque[-1].header.stamp.to_sec(), self.img_right_deque[-1].header.stamp.to_sec(),
-                 self.img_top_deque[-1].header.stamp.to_sec()])
+            required_deques.extend([
+                self.img_left_depth_deque,
+                self.img_right_depth_deque,
+                self.img_top_depth_deque,
+            ])
+        if self.args.use_robot_base:
+            required_deques.append(self.robot_base_deque)
 
-        if len(self.img_left_deque) == 0 or self.img_left_deque[-1].header.stamp.to_sec() < frame_time:
-            print("left image")
-            return False
-        if len(self.img_right_deque) == 0 or self.img_right_deque[-1].header.stamp.to_sec() < frame_time:
-            print("right image")
-            return False
-        # if len(self.img_front_deque) == 0 or self.img_front_deque[-1].header.stamp.to_sec() < frame_time:
-        #     print("front image")
-        #     return False
-        if len(self.master_arm_left_deque) == 0 or self.master_arm_left_deque[-1].header.stamp.to_sec() < frame_time:
-            print("master left")
-            return False
-        if len(self.master_arm_right_deque) == 0 or self.master_arm_right_deque[-1].header.stamp.to_sec() < frame_time:
-            print("master right")
-            return False
-        if len(self.puppet_arm_left_deque) == 0 or self.puppet_arm_left_deque[-1].header.stamp.to_sec() < frame_time:
-            print("pupet left")
-            return False
-        if len(self.puppet_arm_right_deque) == 0 or self.puppet_arm_right_deque[-1].header.stamp.to_sec() < frame_time:
-            print("pupet right")
-            return False
-        # add top image
-        if len(self.img_top_deque) == 0 or self.img_top_deque[-1].header.stamp.to_sec() < frame_time:
-            print("top image")
-            return False
-        if self.args.use_depth_image and (len(self.img_left_depth_deque) == 0 or self.img_left_depth_deque[
-            -1].header.stamp.to_sec() < frame_time):
-            print("left depth ")
-            return False
-        if self.args.use_depth_image and (len(self.img_right_depth_deque) == 0 or self.img_right_depth_deque[
-            -1].header.stamp.to_sec() < frame_time):
-            print("right depth")
-            return False
-        if self.args.use_depth_image and (len(self.img_front_depth_deque) == 0 or self.img_front_depth_deque[
-            -1].header.stamp.to_sec() < frame_time):
-            print("front depth")
-            return False
-        if self.args.use_robot_base and (
-                len(self.robot_base_deque) == 0 or self.robot_base_deque[-1].header.stamp.to_sec() < frame_time):
-            print("base")
-            return False
-        if self.args.use_depth_image and (
-                len(self.img_top_depth_deque) == 0 or self.img_top_depth_deque[-1].header.stamp.to_sec() < frame_time):
-            print("top depth")
+        if any(len(topic_deque) == 0 for topic_deque in required_deques):
             return False
 
-        while self.img_left_deque[0].header.stamp.to_sec() < frame_time:
-            self.img_left_deque.popleft()
-        img_left = self.bridge.imgmsg_to_cv2(self.img_left_deque.popleft(), 'passthrough')
-        # print("img_left:", img_left.shape)
+        frame_time = min(self._latest_stamp(topic_deque) for topic_deque in required_deques)
 
-        while self.img_right_deque[0].header.stamp.to_sec() < frame_time:
-            self.img_right_deque.popleft()
-        img_right = self.bridge.imgmsg_to_cv2(self.img_right_deque.popleft(), 'passthrough')
+        img_left_msg = self._pop_aligned_msg(self.img_left_deque, frame_time)
+        img_right_msg = self._pop_aligned_msg(self.img_right_deque, frame_time)
+        img_top_msg = self._pop_aligned_msg(self.img_top_deque, frame_time)
+        joint_states_left = self._pop_aligned_msg(self.joint_states_left_deque, frame_time)
+        joint_states_right = self._pop_aligned_msg(self.joint_states_right_deque, frame_time)
+        joint_left = self._pop_aligned_msg(self.joint_left_deque, frame_time)
+        joint_right = self._pop_aligned_msg(self.joint_right_deque, frame_time)
+        end_pose_left = self._pop_aligned_msg(self.end_pose_left_deque, frame_time)
+        end_pose_right = self._pop_aligned_msg(self.end_pose_right_deque, frame_time)
+        arm_status_left = self._pop_aligned_msg(self.arm_status_left_deque, frame_time)
+        arm_status_right = self._pop_aligned_msg(self.arm_status_right_deque, frame_time)
 
-        # while self.img_front_deque[0].header.stamp.to_sec() < frame_time:
-        #     self.img_front_deque.popleft()
-        # img_front = self.bridge.imgmsg_to_cv2(self.img_front_deque.popleft(), 'passthrough')
+        if any(item is None for item in [
+            img_left_msg, img_right_msg, img_top_msg, joint_states_left,
+            joint_states_right, joint_left, joint_right, end_pose_left,
+            end_pose_right, arm_status_left, arm_status_right
+        ]):
+            return False
 
-        img_top = self.bridge.imgmsg_to_cv2(self.img_top_deque.popleft(), 'passthrough')
+        img_left = self.bridge.imgmsg_to_cv2(img_left_msg, 'passthrough')
+        img_right = self.bridge.imgmsg_to_cv2(img_right_msg, 'passthrough')
+        img_top = self.bridge.imgmsg_to_cv2(img_top_msg, 'passthrough')
 
-        while self.master_arm_left_deque[0].header.stamp.to_sec() < frame_time:
-            self.master_arm_left_deque.popleft()
-        master_arm_left = self.master_arm_left_deque.popleft()
-
-        while self.master_arm_right_deque[0].header.stamp.to_sec() < frame_time:
-            self.master_arm_right_deque.popleft()
-        master_arm_right = self.master_arm_right_deque.popleft()
-
-        while self.puppet_arm_left_deque[0].header.stamp.to_sec() < frame_time:
-            self.puppet_arm_left_deque.popleft()
-        puppet_arm_left = self.puppet_arm_left_deque.popleft()
-
-        while self.puppet_arm_right_deque[0].header.stamp.to_sec() < frame_time:
-            self.puppet_arm_right_deque.popleft()
-        puppet_arm_right = self.puppet_arm_right_deque.popleft()
-
-        img_left_depth = None
+        img_left_depth, img_right_depth, img_top_depth = None, None, None
         if self.args.use_depth_image:
-            while self.img_left_depth_deque[0].header.stamp.to_sec() < frame_time:
-                self.img_left_depth_deque.popleft()
-            img_left_depth = self.bridge.imgmsg_to_cv2(self.img_left_depth_deque.popleft(), 'passthrough')
+            img_left_depth_msg = self._pop_aligned_msg(self.img_left_depth_deque, frame_time)
+            img_right_depth_msg = self._pop_aligned_msg(self.img_right_depth_deque, frame_time)
+            img_top_depth_msg = self._pop_aligned_msg(self.img_top_depth_deque, frame_time)
+            if img_left_depth_msg is None or img_right_depth_msg is None or img_top_depth_msg is None:
+                return False
+
+            img_left_depth = self.bridge.imgmsg_to_cv2(img_left_depth_msg, 'passthrough')
+            img_right_depth = self.bridge.imgmsg_to_cv2(img_right_depth_msg, 'passthrough')
+            img_top_depth = self.bridge.imgmsg_to_cv2(img_top_depth_msg, 'passthrough')
             top, bottom, left, right = 40, 40, 0, 0
             img_left_depth = cv2.copyMakeBorder(img_left_depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-
-        img_right_depth = None
-        if self.args.use_depth_image:
-            while self.img_right_depth_deque[0].header.stamp.to_sec() < frame_time:
-                self.img_right_depth_deque.popleft()
-            img_right_depth = self.bridge.imgmsg_to_cv2(self.img_right_depth_deque.popleft(), 'passthrough')
-        top, bottom, left, right = 40, 40, 0, 0
-        img_right_depth = cv2.copyMakeBorder(img_right_depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-
-        img_top_depth = None
-        if self.args.use_depth_image:
-            while self.img_top_depth_deque[0].header.stamp.to_sec() < frame_time:
-                self.img_top_depth_deque.popleft()
-            img_top_depth = self.bridge.imgmsg_to_cv2(self.img_top_depth_deque.popleft(), 'passthrough')
-        top, bottom, left, right = 40, 40, 0, 0
-        img_top_depth = cv2.copyMakeBorder(img_top_depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+            img_right_depth = cv2.copyMakeBorder(img_right_depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+            img_top_depth = cv2.copyMakeBorder(img_top_depth, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
         robot_base = None
         if self.args.use_robot_base:
-            while self.robot_base_deque[0].header.stamp.to_sec() < frame_time:
-                self.robot_base_deque.popleft()
-            robot_base = self.robot_base_deque.popleft()
+            robot_base = self._pop_aligned_msg(self.robot_base_deque, frame_time)
+            if robot_base is None:
+                return False
 
-        return (img_left, img_right, img_left_depth, img_right_depth, img_top, img_top_depth,
-                puppet_arm_left, puppet_arm_right, master_arm_left, master_arm_right, robot_base)
+        return (
+            frame_time, img_left, img_right, img_left_depth, img_right_depth, img_top, img_top_depth,
+            joint_states_left, joint_states_right, joint_left, joint_right,
+            end_pose_left, end_pose_right, arm_status_left, arm_status_right, robot_base
+        )
 
     def img_left_callback(self, msg):
-        if len(self.img_left_deque) >= MAX_DEQUE:
-            self.img_left_deque.popleft()
-        self.img_left_deque.append(msg)
+        self._append_with_stamp(self.img_left_deque, msg)
 
     def img_top_callback(self, msg):
-        if len(self.img_top_deque) >= MAX_DEQUE:
-            self.img_top_deque.popleft()
-        self.img_top_deque.append(msg)
+        self._append_with_stamp(self.img_top_deque, msg)
 
     def img_top_depth_callback(self, msg):
-        if len(self.img_top_depth_deque) >= MAX_DEQUE:
-            self.img_top_depth_deque.popleft()
-        self.img_top_depth_deque.append(msg)
+        self._append_with_stamp(self.img_top_depth_deque, msg)
 
     def img_right_callback(self, msg):
-        if len(self.img_right_deque) >= MAX_DEQUE:
-            self.img_right_deque.popleft()
-        self.img_right_deque.append(msg)
-
-    def img_front_callback(self, msg):
-        if len(self.img_front_deque) >= MAX_DEQUE:
-            self.img_front_deque.popleft()
-        self.img_front_deque.append(msg)
+        self._append_with_stamp(self.img_right_deque, msg)
 
     def img_left_depth_callback(self, msg):
-        if len(self.img_left_depth_deque) >= MAX_DEQUE:
-            self.img_left_depth_deque.popleft()
-        self.img_left_depth_deque.append(msg)
+        self._append_with_stamp(self.img_left_depth_deque, msg)
 
     def img_right_depth_callback(self, msg):
-        if len(self.img_right_depth_deque) >= MAX_DEQUE:
-            self.img_right_depth_deque.popleft()
-        self.img_right_depth_deque.append(msg)
+        self._append_with_stamp(self.img_right_depth_deque, msg)
 
-    def img_front_depth_callback(self, msg):
-        if len(self.img_front_depth_deque) >= MAX_DEQUE:
-            self.img_front_depth_deque.popleft()
-        self.img_front_depth_deque.append(msg)
+    def joint_states_left_callback(self, msg):
+        self._append_with_stamp(self.joint_states_left_deque, msg)
 
-    def master_arm_left_callback(self, msg):
-        if len(self.master_arm_left_deque) >= MAX_DEQUE:
-            self.master_arm_left_deque.popleft()
-        self.master_arm_left_deque.append(msg)
+    def joint_states_right_callback(self, msg):
+        self._append_with_stamp(self.joint_states_right_deque, msg)
 
-    def master_arm_right_callback(self, msg):
-        if len(self.master_arm_right_deque) >= MAX_DEQUE:
-            self.master_arm_right_deque.popleft()
-        self.master_arm_right_deque.append(msg)
+    def joint_left_callback(self, msg):
+        self._append_with_stamp(self.joint_left_deque, msg)
 
-    def puppet_arm_left_callback(self, msg):
-        if len(self.puppet_arm_left_deque) >= MAX_DEQUE:
-            self.puppet_arm_left_deque.popleft()
-        self.puppet_arm_left_deque.append(msg)
+    def joint_right_callback(self, msg):
+        self._append_with_stamp(self.joint_right_deque, msg)
 
-    def puppet_arm_right_callback(self, msg):
-        if len(self.puppet_arm_right_deque) >= MAX_DEQUE:
-            self.puppet_arm_right_deque.popleft()
-        self.puppet_arm_right_deque.append(msg)
+    def end_pose_left_callback(self, msg):
+        self._append_with_stamp(self.end_pose_left_deque, msg, use_now=True)
+
+    def end_pose_right_callback(self, msg):
+        self._append_with_stamp(self.end_pose_right_deque, msg, use_now=True)
+
+    def arm_status_left_callback(self, msg):
+        self._append_with_stamp(self.arm_status_left_deque, msg, use_now=True)
+
+    def arm_status_right_callback(self, msg):
+        self._append_with_stamp(self.arm_status_right_deque, msg, use_now=True)
 
     def robot_base_callback(self, msg):
-        if len(self.robot_base_deque) >= MAX_DEQUE:
-            self.robot_base_deque.popleft()
-        self.robot_base_deque.append(msg)
+        self._append_with_stamp(self.robot_base_deque, msg)
 
     def init_ros(self):
         rospy.init_node('record_episodes', anonymous=True)
-        rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=MAX_DEQUE,
-                         tcp_nodelay=True)
-        rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=MAX_DEQUE,
-                         tcp_nodelay=True)
-        # rospy.Subscriber(self.args.img_front_topic, Image, self.img_front_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
         rospy.Subscriber(self.args.img_top_topic, Image, self.img_top_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
         if self.args.use_depth_image:
-            rospy.Subscriber(self.args.img_left_depth_topic, Image, self.img_left_depth_callback, queue_size=MAX_DEQUE,
-                             tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_right_depth_topic, Image, self.img_right_depth_callback,
-                             queue_size=MAX_DEQUE, tcp_nodelay=True)
-            # rospy.Subscriber(self.args.img_front_depth_topic, Image, self.img_front_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_top_depth_topic, Image, self.img_top_depth_callback, queue_size=MAX_DEQUE,
-                             tcp_nodelay=True)
+            rospy.Subscriber(self.args.img_left_depth_topic, Image, self.img_left_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+            rospy.Subscriber(self.args.img_right_depth_topic, Image, self.img_right_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+            rospy.Subscriber(self.args.img_top_depth_topic, Image, self.img_top_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
 
-        rospy.Subscriber(self.args.master_arm_left_topic, JointState, self.master_arm_left_callback,
-                         queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.master_arm_right_topic, JointState, self.master_arm_right_callback,
-                         queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.puppet_arm_left_topic, JointState, self.puppet_arm_left_callback,
-                         queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.puppet_arm_right_topic, JointState, self.puppet_arm_right_callback,
-                         queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.robot_base_topic, Odometry, self.robot_base_callback, queue_size=MAX_DEQUE,
-                         tcp_nodelay=True)
+        rospy.Subscriber(self.args.joint_states_left_topic, JointState, self.joint_states_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.joint_states_right_topic, JointState, self.joint_states_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.joint_left_topic, JointState, self.joint_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.joint_right_topic, JointState, self.joint_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.end_pose_left_topic, Pose, self.end_pose_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.end_pose_right_topic, Pose, self.end_pose_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.arm_status_left_topic, PiperStatusMsg, self.arm_status_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        rospy.Subscriber(self.args.arm_status_right_topic, PiperStatusMsg, self.arm_status_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+
+        if self.args.use_robot_base:
+            rospy.Subscriber(self.args.robot_base_topic, Odometry, self.robot_base_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
 
     def process(self):
         timesteps = []
@@ -455,8 +409,9 @@ class RosOperator:
                 continue
             print_flag = True
             count += 1
-            (img_left, img_right, img_left_depth, img_right_depth, img_top, img_top_depth,
-             puppet_arm_left, puppet_arm_right, master_arm_left, master_arm_right, robot_base) = result
+            (frame_time, img_left, img_right, img_left_depth, img_right_depth, img_top, img_top_depth,
+             joint_states_left, joint_states_right, joint_left, joint_right,
+             end_pose_left, end_pose_right, arm_status_left, arm_status_right, robot_base) = result
             # 2.1 图像信息
             image_dict = dict()
             image_dict[self.args.camera_names[0]] = img_top
@@ -475,20 +430,34 @@ class RosOperator:
                 # image_dict_depth[self.args.camera_names[3]]=img_front_depth
                 obs['images_depth'] = image_dict_depth
             print(Style.RESET_ALL)#  restart color format
-            if np.array(puppet_arm_left.position).sum() < 0.001:
-                print(Fore.GREEN,">>>>>>>>>>>>>>>>>>>>>>>>>>puppet arm left acion is zero>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-                print(np.array(puppet_arm_left.position))
+            joint_left_pos = self._normalize_joint_array(joint_left.position)
+            joint_right_pos = self._normalize_joint_array(joint_right.position)
+            if np.array(joint_left_pos).sum() < 0.001:
+                print(Fore.GREEN,">>>>>>>>>>>>>>>>>>>>>>>>>>joint_left action is zero>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                print(joint_left_pos)
                 # exit(0)
-            if np.array(puppet_arm_right.position).sum() < 0.001:
-                print(Fore.GREEN,">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>puppet right arm qpos is zero>>>>>>>>>>>>>>>>>>>>>>>>>>")
-                print(np.array(puppet_arm_right.position))
+            if np.array(joint_right_pos).sum() < 0.001:
+                print(Fore.GREEN,">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>joint_right qpos is zero>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                print(joint_right_pos)
                 # exit(0)
-            obs['qpos'] = np.concatenate((np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)),
-                                         axis=0)
-            obs['qvel'] = np.concatenate((np.array(puppet_arm_left.velocity), np.array(puppet_arm_right.velocity)),
-                                         axis=0)
-            obs['effort'] = np.concatenate((np.array(puppet_arm_left.effort), np.array(puppet_arm_right.effort)),
-                                           axis=0)
+            obs['qpos'] = np.concatenate((
+                self._normalize_joint_array(joint_states_left.position),
+                self._normalize_joint_array(joint_states_right.position)
+            ), axis=0)
+            obs['qvel'] = np.concatenate((
+                self._normalize_joint_array(joint_states_left.velocity),
+                self._normalize_joint_array(joint_states_right.velocity)
+            ), axis=0)
+            obs['effort'] = np.concatenate((
+                self._normalize_joint_array(joint_states_left.effort),
+                self._normalize_joint_array(joint_states_right.effort)
+            ), axis=0)
+            obs['end_pose'] = np.concatenate((self._pose_to_np(end_pose_left), self._pose_to_np(end_pose_right)), axis=0)
+            obs['arm_status'] = np.concatenate(
+                (self._arm_status_to_np(arm_status_left), self._arm_status_to_np(arm_status_right)),
+                axis=0
+            )
+            obs['frame_timestamp'] = np.array([frame_time], dtype=np.float64)
             if self.args.use_robot_base:
                 obs['base_vel'] = [robot_base.twist.twist.linear.x, robot_base.twist.twist.angular.z]
                 print("base", obs['base_vel'])
@@ -512,8 +481,8 @@ class RosOperator:
                 discount=None,
                 observation=obs)
 
-            # 主臂保存状态
-            action = np.concatenate((np.array(master_arm_left.position), np.array(master_arm_right.position)), axis=0)
+            # action 保存 /joint_left + /joint_right
+            action = np.concatenate((joint_left_pos, joint_right_pos), axis=0)
             # print(Fore.YELLOW,"left action:\n", action[0:7])
             # print(Fore.GREEN, "right action:\n", action[7:])
             actions.append(action)
@@ -570,15 +539,23 @@ def get_arguments():
     parser.add_argument('--img_right_depth_topic', action='store', type=str, help='img_right_depth_topic',
                         default='/camera_r/depth/image_raw', required=False)
 
-    # topic name of arm
-    parser.add_argument('--master_arm_left_topic', action='store', type=str, help='master_arm_left_topic',
-                        default='/master/joint_left', required=False)
-    parser.add_argument('--master_arm_right_topic', action='store', type=str, help='master_arm_right_topic',
-                        default='/master/joint_right', required=False)
-    parser.add_argument('--puppet_arm_left_topic', action='store', type=str, help='puppet_arm_left_topic',
-                        default='/puppet/joint_left', required=False)
-    parser.add_argument('--puppet_arm_right_topic', action='store', type=str, help='puppet_arm_right_topic',
-                        default='/puppet/joint_right', required=False)
+    # topic name of arm (left/right data)
+    parser.add_argument('--joint_states_left_topic', action='store', type=str, help='joint_states_left_topic',
+                        default='/joint_states_left', required=False)
+    parser.add_argument('--joint_states_right_topic', action='store', type=str, help='joint_states_right_topic',
+                        default='/joint_states_right', required=False)
+    parser.add_argument('--joint_left_topic', action='store', type=str, help='joint_left_topic',
+                        default='/joint_left', required=False)
+    parser.add_argument('--joint_right_topic', action='store', type=str, help='joint_right_topic',
+                        default='/joint_right', required=False)
+    parser.add_argument('--end_pose_left_topic', action='store', type=str, help='end_pose_left_topic',
+                        default='/end_pose_left', required=False)
+    parser.add_argument('--end_pose_right_topic', action='store', type=str, help='end_pose_right_topic',
+                        default='/end_pose_right', required=False)
+    parser.add_argument('--arm_status_left_topic', action='store', type=str, help='arm_status_left_topic',
+                        default='/arm_status_left', required=False)
+    parser.add_argument('--arm_status_right_topic', action='store', type=str, help='arm_status_right_topic',
+                        default='/arm_status_right', required=False)
 
     # topic name of robot_base
     parser.add_argument('--robot_base_topic', action='store', type=str, help='robot_base_topic',
