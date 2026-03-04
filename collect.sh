@@ -7,9 +7,9 @@ MAX_STEPS=4000
 FRAME_RATE=30
 LANGUAGE_RAW="Do folds on the shorts."
 
-source ~/miniconda3/bin/activate
-conda activate aloha
-cd collect_data
+# source ~/miniconda3/bin/activate
+# conda activate aloha
+# cd collect_data
 
 mkdir -p "$DATASET_DIR/$TASK_NAME"
 
