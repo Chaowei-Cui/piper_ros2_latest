@@ -79,6 +79,10 @@ def save_data(args, timesteps, actions, dataset_path):
     # 数据字典
     data_size = len(actions)
     global SUBTASK_FLAG
+
+    # Determine number of joints from actual data
+    num_joints = len(actions[0]) if len(actions) > 0 else args.num_joints
+
     data_dict = {
         # 一个是奖励里面的qpos，qvel， effort ,一个是实际发的acition
         '/observations/qpos': [],
@@ -145,10 +149,10 @@ def save_data(args, timesteps, actions, dataset_path):
                 _ = image_depth.create_dataset(cam_name, (data_size, 480, 640), dtype='uint16',
                                                chunks=(1, 480, 640), )
 
-        _ = obs.create_dataset('qpos', (data_size, 14))
-        _ = obs.create_dataset('qvel', (data_size, 14))
-        _ = obs.create_dataset('effort', (data_size, 14))
-        _ = root.create_dataset('action', (data_size, 14))
+        _ = obs.create_dataset('qpos', (data_size, num_joints))
+        _ = obs.create_dataset('qvel', (data_size, num_joints))
+        _ = obs.create_dataset('effort', (data_size, num_joints))
+        _ = root.create_dataset('action', (data_size, num_joints))
         _ = root.create_dataset('base_action', (data_size, 2))
         _ = root.create_dataset('subtask', (data_size, 1), dtype='uint8')
 
@@ -338,11 +342,17 @@ class RosOperator(Node):
         if len(self.img_left_deque) >= MAX_DEQUE:
             self.img_left_deque.popleft()
         self.img_left_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.img_left_deque) <= 3:
+            print(f"Left image received, deque size: {len(self.img_left_deque)}")
 
     def img_top_callback(self, msg):
         if len(self.img_top_deque) >= MAX_DEQUE:
             self.img_top_deque.popleft()
         self.img_top_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.img_top_deque) <= 3:
+            print(f"Top image received, deque size: {len(self.img_top_deque)}")
 
     def img_top_depth_callback(self, msg):
         if len(self.img_top_depth_deque) >= MAX_DEQUE:
@@ -353,6 +363,9 @@ class RosOperator(Node):
         if len(self.img_right_deque) >= MAX_DEQUE:
             self.img_right_deque.popleft()
         self.img_right_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.img_right_deque) <= 3:
+            print(f"Right image received, deque size: {len(self.img_right_deque)}")
 
     def img_front_callback(self, msg):
         if len(self.img_front_deque) >= MAX_DEQUE:
@@ -378,21 +391,33 @@ class RosOperator(Node):
         if len(self.master_arm_left_deque) >= MAX_DEQUE:
             self.master_arm_left_deque.popleft()
         self.master_arm_left_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.master_arm_left_deque) <= 3:
+            print(f"Master left arm received, deque size: {len(self.master_arm_left_deque)}")
 
     def master_arm_right_callback(self, msg):
         if len(self.master_arm_right_deque) >= MAX_DEQUE:
             self.master_arm_right_deque.popleft()
         self.master_arm_right_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.master_arm_right_deque) <= 3:
+            print(f"Master right arm received, deque size: {len(self.master_arm_right_deque)}")
 
     def puppet_arm_left_callback(self, msg):
         if len(self.puppet_arm_left_deque) >= MAX_DEQUE:
             self.puppet_arm_left_deque.popleft()
         self.puppet_arm_left_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.puppet_arm_left_deque) <= 3:
+            print(f"Puppet left arm received, deque size: {len(self.puppet_arm_left_deque)}")
 
     def puppet_arm_right_callback(self, msg):
         if len(self.puppet_arm_right_deque) >= MAX_DEQUE:
             self.puppet_arm_right_deque.popleft()
         self.puppet_arm_right_deque.append(msg)
+        # Debug: print first few messages
+        if len(self.puppet_arm_right_deque) <= 3:
+            print(f"Puppet right arm received, deque size: {len(self.puppet_arm_right_deque)}")
 
     def robot_base_callback(self, msg):
         if len(self.robot_base_deque) >= MAX_DEQUE:
@@ -401,22 +426,39 @@ class RosOperator(Node):
 
     def init_ros(self):
         # ROS2 subscriptions
+        print(f"Subscribing to image topics:")
+        print(f"  Left: {self.args.img_left_topic}")
+        print(f"  Right: {self.args.img_right_topic}")
+        print(f"  Top: {self.args.img_top_topic}")
+
         self.create_subscription(Image, self.args.img_left_topic, self.img_left_callback, MAX_DEQUE)
         self.create_subscription(Image, self.args.img_right_topic, self.img_right_callback, MAX_DEQUE)
         # self.create_subscription(Image, self.args.img_front_topic, self.img_front_callback, MAX_DEQUE)
         self.create_subscription(Image, self.args.img_top_topic, self.img_top_callback, MAX_DEQUE)
 
         if self.args.use_depth_image:
+            print(f"Subscribing to depth topics:")
+            print(f"  Left depth: {self.args.img_left_depth_topic}")
+            print(f"  Right depth: {self.args.img_right_depth_topic}")
+            print(f"  Top depth: {self.args.img_top_depth_topic}")
             self.create_subscription(Image, self.args.img_left_depth_topic, self.img_left_depth_callback, MAX_DEQUE)
             self.create_subscription(Image, self.args.img_right_depth_topic, self.img_right_depth_callback, MAX_DEQUE)
             # self.create_subscription(Image, self.args.img_front_depth_topic, self.img_front_depth_callback, MAX_DEQUE)
             self.create_subscription(Image, self.args.img_top_depth_topic, self.img_top_depth_callback, MAX_DEQUE)
+
+        print(f"Subscribing to arm topics:")
+        print(f"  Master left: {self.args.master_arm_left_topic}")
+        print(f"  Master right: {self.args.master_arm_right_topic}")
+        print(f"  Puppet left: {self.args.puppet_arm_left_topic}")
+        print(f"  Puppet right: {self.args.puppet_arm_right_topic}")
 
         self.create_subscription(JointState, self.args.master_arm_left_topic, self.master_arm_left_callback, MAX_DEQUE)
         self.create_subscription(JointState, self.args.master_arm_right_topic, self.master_arm_right_callback, MAX_DEQUE)
         self.create_subscription(JointState, self.args.puppet_arm_left_topic, self.puppet_arm_left_callback, MAX_DEQUE)
         self.create_subscription(JointState, self.args.puppet_arm_right_topic, self.puppet_arm_right_callback, MAX_DEQUE)
         self.create_subscription(Odometry, self.args.robot_base_topic, self.robot_base_callback, MAX_DEQUE)
+
+        print("All subscriptions created successfully!")
 
     def process(self):
         timesteps = []
@@ -438,6 +480,9 @@ class RosOperator(Node):
 
         while ((count < self.args.max_timesteps + 1) and not saveData) and rclpy.ok():
             # 2 收集数据
+            # Spin once to process callbacks
+            rclpy.spin_once(self, timeout_sec=0.001)
+
             # print(Back.BLUE) # Set background color red
             result = self.get_frame()
             CUR_STEP = count
@@ -447,7 +492,7 @@ class RosOperator(Node):
                     print(Fore.RED,">>>>>>>>>>>>>>>>>>>>>>>>>>syn fail>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
                     print_flag = False
                 # rate.sleep()
-                rclpy.spin_once(self, timeout_sec=0.001)
+                time.sleep(0.01)  # Small delay to allow callbacks to populate deques
                 continue
             print_flag = True
             count += 1
@@ -590,6 +635,8 @@ def get_arguments():
     parser.add_argument('--frame_rate', action='store', type=int, help='frame_rate',
                         default=30, required=False)
     parser.add_argument('--language_raw', type=str, help="task instruction", default="None")
+    parser.add_argument('--num_joints', action='store', type=int, help='Total number of joints (both arms)',
+                        default=12, required=False)
 
     args = parser.parse_args()
     return args
@@ -603,9 +650,12 @@ def main():
     args = get_arguments()
     ros_operator = RosOperator(args)
 
-    # Spin in a separate thread to allow callbacks to be processed
-    spin_thread = threading.Thread(target=lambda: rclpy.spin(ros_operator), daemon=True)
-    spin_thread.start()
+    # Don't use a separate spin thread - spin_once is called in process()
+    # Wait a bit for initial messages to arrive
+    print("Waiting for initial messages...")
+    for i in range(50):
+        rclpy.spin_once(ros_operator, timeout_sec=0.1)
+    print("Starting data collection...")
 
     timesteps, actions = ros_operator.process()
     dataset_dir = os.path.join(args.dataset_dir, args.task_name)
