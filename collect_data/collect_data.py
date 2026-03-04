@@ -98,6 +98,19 @@ def _pose_to_vec(msg):
     ], dtype=np.float32)
 
 
+def _align_joint_vec(vec, target_dim):
+    arr = np.asarray(vec, dtype=np.float32)
+    if arr.shape[0] == target_dim:
+        return arr
+    if arr.shape[0] == 0:
+        return np.zeros((target_dim,), dtype=np.float32)
+    if arr.shape[0] > target_dim:
+        return arr[:target_dim]
+    out = np.zeros((target_dim,), dtype=np.float32)
+    out[:arr.shape[0]] = arr
+    return out
+
+
 # 保存数据函数
 def save_data(args, timesteps, actions, dataset_path):
     data_size = len(actions)
@@ -108,11 +121,25 @@ def save_data(args, timesteps, actions, dataset_path):
 
     first_obs = timesteps[0].observation
     qpos_dim = int(np.asarray(first_obs['qpos']).shape[0])
+    qvel_dim = int(np.asarray(first_obs['qvel']).shape[0])
+    effort_dim = int(np.asarray(first_obs['effort']).shape[0])
     action_dim = int(np.asarray(actions[0]).shape[0])
-    js_left_dim = int(np.asarray(first_obs['joint_states_left_pos']).shape[0])
-    js_right_dim = int(np.asarray(first_obs['joint_states_right_pos']).shape[0])
-    j_left_dim = int(np.asarray(first_obs['joint_left_pos']).shape[0])
-    j_right_dim = int(np.asarray(first_obs['joint_right_pos']).shape[0])
+    js_left_pos_dim = int(np.asarray(first_obs['joint_states_left_pos']).shape[0])
+    js_left_vel_dim = int(np.asarray(first_obs['joint_states_left_vel']).shape[0])
+    js_left_eff_dim = int(np.asarray(first_obs['joint_states_left_eff']).shape[0])
+    js_right_pos_dim = int(np.asarray(first_obs['joint_states_right_pos']).shape[0])
+    js_right_vel_dim = int(np.asarray(first_obs['joint_states_right_vel']).shape[0])
+    js_right_eff_dim = int(np.asarray(first_obs['joint_states_right_eff']).shape[0])
+    j_left_pos_dim = int(np.asarray(first_obs['joint_left_pos']).shape[0])
+    j_left_vel_dim = int(np.asarray(first_obs['joint_left_vel']).shape[0])
+    j_left_eff_dim = int(np.asarray(first_obs['joint_left_eff']).shape[0])
+    j_right_pos_dim = int(np.asarray(first_obs['joint_right_pos']).shape[0])
+    j_right_vel_dim = int(np.asarray(first_obs['joint_right_vel']).shape[0])
+    j_right_eff_dim = int(np.asarray(first_obs['joint_right_eff']).shape[0])
+    print(
+        f"[save_data] dims qpos/qvel/effort/action: "
+        f"{qpos_dim}/{qvel_dim}/{effort_dim}/{action_dim}"
+    )
 
     data_dict = {
         '/observations/qpos': [],
@@ -198,32 +225,32 @@ def save_data(args, timesteps, actions, dataset_path):
                 image_depth.create_dataset(cam_name, (data_size, 480, 640), dtype='uint16', chunks=(1, 480, 640))
 
         obs.create_dataset('qpos', (data_size, qpos_dim))
-        obs.create_dataset('qvel', (data_size, qpos_dim))
-        obs.create_dataset('effort', (data_size, qpos_dim))
+        obs.create_dataset('qvel', (data_size, qvel_dim))
+        obs.create_dataset('effort', (data_size, effort_dim))
         root.create_dataset('action', (data_size, action_dim))
         root.create_dataset('base_action', (data_size, 2))
         root.create_dataset('subtask', (data_size, 1), dtype='uint8')
 
         arm = root.create_group('arm')
         js_left = arm.create_group('joint_states_left')
-        js_left.create_dataset('position', (data_size, js_left_dim))
-        js_left.create_dataset('velocity', (data_size, js_left_dim))
-        js_left.create_dataset('effort', (data_size, js_left_dim))
+        js_left.create_dataset('position', (data_size, js_left_pos_dim))
+        js_left.create_dataset('velocity', (data_size, js_left_vel_dim))
+        js_left.create_dataset('effort', (data_size, js_left_eff_dim))
 
         js_right = arm.create_group('joint_states_right')
-        js_right.create_dataset('position', (data_size, js_right_dim))
-        js_right.create_dataset('velocity', (data_size, js_right_dim))
-        js_right.create_dataset('effort', (data_size, js_right_dim))
+        js_right.create_dataset('position', (data_size, js_right_pos_dim))
+        js_right.create_dataset('velocity', (data_size, js_right_vel_dim))
+        js_right.create_dataset('effort', (data_size, js_right_eff_dim))
 
         j_left = arm.create_group('joint_left')
-        j_left.create_dataset('position', (data_size, j_left_dim))
-        j_left.create_dataset('velocity', (data_size, j_left_dim))
-        j_left.create_dataset('effort', (data_size, j_left_dim))
+        j_left.create_dataset('position', (data_size, j_left_pos_dim))
+        j_left.create_dataset('velocity', (data_size, j_left_vel_dim))
+        j_left.create_dataset('effort', (data_size, j_left_eff_dim))
 
         j_right = arm.create_group('joint_right')
-        j_right.create_dataset('position', (data_size, j_right_dim))
-        j_right.create_dataset('velocity', (data_size, j_right_dim))
-        j_right.create_dataset('effort', (data_size, j_right_dim))
+        j_right.create_dataset('position', (data_size, j_right_pos_dim))
+        j_right.create_dataset('velocity', (data_size, j_right_vel_dim))
+        j_right.create_dataset('effort', (data_size, j_right_eff_dim))
 
         arm.create_dataset('end_pose_left', (data_size, 7), dtype='float32')
         arm.create_dataset('end_pose_right', (data_size, 7), dtype='float32')
@@ -499,19 +526,19 @@ class RosOperator(Node):
 
             print(Style.RESET_ALL)
 
-            obs['joint_states_left_pos'] = np.array(joint_states_left.position)
-            obs['joint_states_left_vel'] = np.array(joint_states_left.velocity)
-            obs['joint_states_left_eff'] = np.array(joint_states_left.effort)
-            obs['joint_states_right_pos'] = np.array(joint_states_right.position)
-            obs['joint_states_right_vel'] = np.array(joint_states_right.velocity)
-            obs['joint_states_right_eff'] = np.array(joint_states_right.effort)
+            obs['joint_states_left_pos'] = np.asarray(joint_states_left.position, dtype=np.float32)
+            obs['joint_states_left_vel'] = _align_joint_vec(joint_states_left.velocity, obs['joint_states_left_pos'].shape[0])
+            obs['joint_states_left_eff'] = _align_joint_vec(joint_states_left.effort, obs['joint_states_left_pos'].shape[0])
+            obs['joint_states_right_pos'] = np.asarray(joint_states_right.position, dtype=np.float32)
+            obs['joint_states_right_vel'] = _align_joint_vec(joint_states_right.velocity, obs['joint_states_right_pos'].shape[0])
+            obs['joint_states_right_eff'] = _align_joint_vec(joint_states_right.effort, obs['joint_states_right_pos'].shape[0])
 
-            obs['joint_left_pos'] = np.array(joint_left.position)
-            obs['joint_left_vel'] = np.array(joint_left.velocity)
-            obs['joint_left_eff'] = np.array(joint_left.effort)
-            obs['joint_right_pos'] = np.array(joint_right.position)
-            obs['joint_right_vel'] = np.array(joint_right.velocity)
-            obs['joint_right_eff'] = np.array(joint_right.effort)
+            obs['joint_left_pos'] = np.asarray(joint_left.position, dtype=np.float32)
+            obs['joint_left_vel'] = _align_joint_vec(joint_left.velocity, obs['joint_left_pos'].shape[0])
+            obs['joint_left_eff'] = _align_joint_vec(joint_left.effort, obs['joint_left_pos'].shape[0])
+            obs['joint_right_pos'] = np.asarray(joint_right.position, dtype=np.float32)
+            obs['joint_right_vel'] = _align_joint_vec(joint_right.velocity, obs['joint_right_pos'].shape[0])
+            obs['joint_right_eff'] = _align_joint_vec(joint_right.effort, obs['joint_right_pos'].shape[0])
 
             obs['end_pose_left'] = _pose_to_vec(end_pose_left)
             obs['end_pose_right'] = _pose_to_vec(end_pose_right)
