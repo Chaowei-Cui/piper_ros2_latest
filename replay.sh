@@ -5,6 +5,8 @@ DATASET_DIR="/home/agilex/data/sss"
 TASK_NAME="123"
 EPISODE_IDX=0
 FRAME_RATE=30
+POS_CMD_MODE1=0
+POS_CMD_MODE2=0
 
 source ~/miniconda3/bin/activate
 conda activate aloha
@@ -14,4 +16,6 @@ python3 replay_data.py \
     --dataset_dir "$DATASET_DIR" \
     --task_name "$TASK_NAME" \
     --episode_idx "$EPISODE_IDX" \
-    --frame_rate "$FRAME_RATE"
+    --frame_rate "$FRAME_RATE" \
+    --pos_cmd_mode1 "$POS_CMD_MODE1" \
+    --pos_cmd_mode2 "$POS_CMD_MODE2"
