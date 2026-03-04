@@ -1,5 +1,5 @@
 #!/bin/bash
-
+source /opt/ros/humble/share/realsense2_camera/install/setup.bash
 # 切换到 launch 文件目录
 cd /opt/ros/humble/share/realsense2_camera/launch
 

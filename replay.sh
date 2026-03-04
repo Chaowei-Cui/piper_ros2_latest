@@ -1,13 +1,14 @@
 #!/bin/bash
+source install/setup.bash
 set -euo pipefail
 
 DATASET_DIR="/home/agilex/data/sss"
 TASK_NAME="123"
-EPISODE_IDX=0
+EPISODE_IDX=7
 FRAME_RATE=30
 
-source ~/miniconda3/bin/activate
-conda activate aloha
+# source ~/miniconda3/bin/activate
+# conda activate aloha
 cd collect_data
 
 python3 replay_data.py \
