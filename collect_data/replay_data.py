@@ -57,17 +57,19 @@ def load_hdf5(dataset_dir, task_name, episode_idx):
             effort = root['/observations/effort'][()] if '/observations/effort' in root else np.zeros_like(qpos)
             action = root['/action'][()] if '/action' in root else qpos
 
+            q_split = qpos.shape[1] // 2
+            a_split = action.shape[1] // 2
             data['joint_states_left'] = {
-                'position': qpos[:, :7], 'velocity': qvel[:, :7], 'effort': effort[:, :7]
+                'position': qpos[:, :q_split], 'velocity': qvel[:, :q_split], 'effort': effort[:, :q_split]
             }
             data['joint_states_right'] = {
-                'position': qpos[:, 7:14], 'velocity': qvel[:, 7:14], 'effort': effort[:, 7:14]
+                'position': qpos[:, q_split:], 'velocity': qvel[:, q_split:], 'effort': effort[:, q_split:]
             }
             data['joint_left'] = {
-                'position': action[:, :7], 'velocity': np.zeros_like(action[:, :7]), 'effort': np.zeros_like(action[:, :7])
+                'position': action[:, :a_split], 'velocity': np.zeros_like(action[:, :a_split]), 'effort': np.zeros_like(action[:, :a_split])
             }
             data['joint_right'] = {
-                'position': action[:, 7:14], 'velocity': np.zeros_like(action[:, 7:14]), 'effort': np.zeros_like(action[:, 7:14])
+                'position': action[:, a_split:], 'velocity': np.zeros_like(action[:, a_split:]), 'effort': np.zeros_like(action[:, a_split:])
             }
             n = action.shape[0]
             data['end_pose_left'] = np.zeros((n, 7), dtype=np.float32)
@@ -113,13 +115,27 @@ class Ros2Replayer(Node):
         self.pub_arm_status_left = self.create_publisher(PiperStatusMsg, args.arm_status_left_topic, default_qos)
         self.pub_arm_status_right = self.create_publisher(PiperStatusMsg, args.arm_status_right_topic, default_qos)
 
+    @staticmethod
+    def _align_vec_len(vec, target_len):
+        arr = np.asarray(vec, dtype=np.float64)
+        if arr.shape[0] == target_len:
+            return arr
+        if arr.shape[0] > target_len:
+            return arr[:target_len]
+        out = np.zeros((target_len,), dtype=np.float64)
+        out[:arr.shape[0]] = arr
+        return out
+
     def _build_joint_msg(self, position, velocity, effort):
+        pos = np.asarray(position, dtype=np.float64)
+        vel = self._align_vec_len(velocity, pos.shape[0])
+        eff = self._align_vec_len(effort, pos.shape[0])
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = [f'joint{i}' for i in range(7)]
-        msg.position = position.tolist()
-        msg.velocity = velocity.tolist()
-        msg.effort = effort.tolist()
+        msg.name = [f'joint{i + 1}' for i in range(pos.shape[0])]
+        msg.position = pos.tolist()
+        msg.velocity = vel.tolist()
+        msg.effort = eff.tolist()
         return msg
 
     @staticmethod
@@ -207,9 +223,9 @@ class Ros2Replayer(Node):
                 break
 
             # Publish RGB
-            self.pub_rgb_top.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_top][i], encoding='bgr8'))
-            self.pub_rgb_left.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_left][i], encoding='bgr8'))
-            self.pub_rgb_right.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_right][i], encoding='bgr8'))
+            self.pub_rgb_top.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_top][i], encoding='passthrough'))
+            self.pub_rgb_left.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_left][i], encoding='passthrough'))
+            self.pub_rgb_right.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_right][i], encoding='passthrough'))
 
             # Publish Depth (if present)
             if all(cam in data['images_depth'] for cam in [cam_top, cam_left, cam_right]):
@@ -267,10 +283,14 @@ class Ros2Replayer(Node):
             self.pub_end_pose_right.publish(self._build_pose_msg(data['end_pose_right'][i]))
             self.pub_arm_status_left.publish(self._build_status_msg(data['arm_status_left'][i]))
             self.pub_arm_status_right.publish(self._build_status_msg(data['arm_status_right'][i]))
+            left_pos = data['joint_left']['position'][i]
+            right_pos = data['joint_right']['position'][i]
+            left_gripper = float(left_pos[6]) if len(left_pos) > 6 else (float(left_pos[-1]) if len(left_pos) > 0 else 0.0)
+            right_gripper = float(right_pos[6]) if len(right_pos) > 6 else (float(right_pos[-1]) if len(right_pos) > 0 else 0.0)
             self.pub_pos_cmd_left.publish(
                 self._build_pos_cmd(
                     data['end_pose_left'][i],
-                    data['joint_left']['position'][i][6],
+                    left_gripper,
                     self.args.pos_cmd_mode1,
                     self.args.pos_cmd_mode2,
                 )
@@ -278,7 +298,7 @@ class Ros2Replayer(Node):
             self.pub_pos_cmd_right.publish(
                 self._build_pos_cmd(
                     data['end_pose_right'][i],
-                    data['joint_right']['position'][i][6],
+                    right_gripper,
                     self.args.pos_cmd_mode1,
                     self.args.pos_cmd_mode2,
                 )
