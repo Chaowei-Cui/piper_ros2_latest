@@ -30,7 +30,6 @@ python3 collect_data.py \
     --frame_rate "$FRAME_RATE" \
     --episode_idx "$next_num" \
     --language_raw "$LANGUAGE_RAW" \
-    --use_depth_image True \
     --joint_states_left_topic /joint_states_left \
     --joint_states_right_topic /joint_states_right \
     --joint_left_topic /joint_left \
@@ -44,4 +43,5 @@ python3 collect_data.py \
     --img_top_topic /camera/top/color/image_raw \
     --img_left_depth_topic /camera/left/depth/image_rect_raw \
     --img_right_depth_topic /camera/right/depth/image_rect_raw \
-    --img_top_depth_topic /camera/top/depth/image_rect_raw
+    --img_top_depth_topic /camera/top/depth/image_rect_raw 
+    # --use_depth_image False \
