@@ -9,7 +9,10 @@ import threading
 import collections
 from collections import deque
 from pynput import keyboard
-import rospy
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import QoSProfile, SensorDataQoS
 from sensor_msgs.msg import JointState
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
@@ -39,6 +42,17 @@ global PRE_TIME_STAMP
 PRE_TIME_STAMP = time.time()
 
 SUBTASK_FLAG = np.zeros((10000, 1))
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError(f'Boolean value expected, got {value}')
 
 
 def onPress(key):
@@ -168,10 +182,14 @@ def save_data(args, timesteps, actions, dataset_path):
     print(f'\033[32m\nSaving: {time.time() - t0:.1f} secs. %s \033[0m\n' % dataset_path)
 
 
-class RosOperator:
+class RosOperator(Node):
     def __init__(self, args):
+        super().__init__('record_episodes')
         self.args = args
         self.bridge = CvBridge()
+        self.qos_sensor = SensorDataQoS()
+        self.qos_reliable = QoSProfile(depth=MAX_DEQUE)
+        self.subscribers = []
         self.arm_status_fields = [
             'ctrl_mode', 'arm_status', 'mode_feedback', 'teach_status', 'motion_status',
             'trajectory_num', 'err_code', 'joint_1_angle_limit', 'joint_2_angle_limit',
@@ -200,12 +218,23 @@ class RosOperator:
         self.robot_base_deque = deque(maxlen=MAX_DEQUE)
         self.init_ros()
 
+    def _now_sec(self):
+        return self.get_clock().now().nanoseconds / 1e9
+
+    @staticmethod
+    def _stamp_to_sec(stamp):
+        if hasattr(stamp, 'to_sec'):
+            return stamp.to_sec()
+        if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec'):
+            return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        return None
+
     def _append_with_stamp(self, topic_deque, msg, use_now=False):
         stamp = None
         if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
-            stamp = msg.header.stamp.to_sec()
+            stamp = self._stamp_to_sec(msg.header.stamp)
         if use_now or stamp is None or stamp <= 0:
-            stamp = rospy.Time.now().to_sec()
+            stamp = self._now_sec()
         topic_deque.append((stamp, msg))
 
     def _latest_stamp(self, topic_deque):
@@ -356,26 +385,34 @@ class RosOperator:
         self._append_with_stamp(self.robot_base_deque, msg)
 
     def init_ros(self):
-        rospy.init_node('record_episodes', anonymous=True)
-        rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.img_top_topic, Image, self.img_top_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        if self.args.use_depth_image:
-            rospy.Subscriber(self.args.img_left_depth_topic, Image, self.img_left_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_right_depth_topic, Image, self.img_right_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_top_depth_topic, Image, self.img_top_depth_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        self.subscribers.append(self.create_subscription(Image, self.args.img_left_topic, self.img_left_callback, self.qos_sensor))
+        self.subscribers.append(self.create_subscription(Image, self.args.img_right_topic, self.img_right_callback, self.qos_sensor))
+        self.subscribers.append(self.create_subscription(Image, self.args.img_top_topic, self.img_top_callback, self.qos_sensor))
 
-        rospy.Subscriber(self.args.joint_states_left_topic, JointState, self.joint_states_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.joint_states_right_topic, JointState, self.joint_states_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.joint_left_topic, JointState, self.joint_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.joint_right_topic, JointState, self.joint_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.end_pose_left_topic, Pose, self.end_pose_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.end_pose_right_topic, Pose, self.end_pose_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.arm_status_left_topic, PiperStatusMsg, self.arm_status_left_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
-        rospy.Subscriber(self.args.arm_status_right_topic, PiperStatusMsg, self.arm_status_right_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+        self.get_logger().info(f'img_left_topic: {self.args.img_left_topic}')
+        self.get_logger().info(f'img_right_topic: {self.args.img_right_topic}')
+        self.get_logger().info(f'img_top_topic: {self.args.img_top_topic}')
+
+        if self.args.use_depth_image:
+            self.subscribers.append(self.create_subscription(Image, self.args.img_left_depth_topic, self.img_left_depth_callback, self.qos_sensor))
+            self.subscribers.append(self.create_subscription(Image, self.args.img_right_depth_topic, self.img_right_depth_callback, self.qos_sensor))
+            self.subscribers.append(self.create_subscription(Image, self.args.img_top_depth_topic, self.img_top_depth_callback, self.qos_sensor))
+            self.get_logger().info(f'img_left_depth_topic: {self.args.img_left_depth_topic}')
+            self.get_logger().info(f'img_right_depth_topic: {self.args.img_right_depth_topic}')
+            self.get_logger().info(f'img_top_depth_topic: {self.args.img_top_depth_topic}')
+
+        self.subscribers.append(self.create_subscription(JointState, self.args.joint_states_left_topic, self.joint_states_left_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(JointState, self.args.joint_states_right_topic, self.joint_states_right_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(JointState, self.args.joint_left_topic, self.joint_left_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(JointState, self.args.joint_right_topic, self.joint_right_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(Pose, self.args.end_pose_left_topic, self.end_pose_left_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(Pose, self.args.end_pose_right_topic, self.end_pose_right_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(PiperStatusMsg, self.args.arm_status_left_topic, self.arm_status_left_callback, self.qos_reliable))
+        self.subscribers.append(self.create_subscription(PiperStatusMsg, self.args.arm_status_right_topic, self.arm_status_right_callback, self.qos_reliable))
 
         if self.args.use_robot_base:
-            rospy.Subscriber(self.args.robot_base_topic, Odometry, self.robot_base_callback, queue_size=MAX_DEQUE, tcp_nodelay=True)
+            self.subscribers.append(self.create_subscription(Odometry, self.args.robot_base_topic, self.robot_base_callback, self.qos_reliable))
+            self.get_logger().info(f'robot_base_topic: {self.args.robot_base_topic}')
 
     def process(self):
         timesteps = []
@@ -388,14 +425,14 @@ class RosOperator:
         count = 0
 
         # input_key = input("please input s:")
-        # while input_key != 's' and not rospy.is_shutdown():
+        # while input_key != 's' and not rclpy.ok():
         #     input_key = input("please input s:")
 
-        rate = rospy.Rate(self.args.frame_rate)
+        frame_sleep = 1.0 / max(1, self.args.frame_rate)
         print_flag = True
         global CUR_STEP
 
-        while ((count < self.args.max_timesteps + 1) and not saveData) and not rospy.is_shutdown():
+        while ((count < self.args.max_timesteps + 1) and not saveData) and rclpy.ok():
             # 2 收集数据
             # print(Back.BLUE) # Set background color red
             result = self.get_frame()
@@ -495,9 +532,9 @@ class RosOperator:
             timesteps.append(ts)
             print(Fore.BLUE,f"Frame data: {count}, current subtask: {SUBTASK_STEP}")
             print(Style.RESET_ALL)
-            if rospy.is_shutdown():
+            if not rclpy.ok():
                 exit(-1)
-            rate.sleep()
+            time.sleep(frame_sleep)
 
         print("len(timesteps): ", len(timesteps))
         print("len(actions)  : ", len(actions))
@@ -516,28 +553,28 @@ def get_arguments():
     parser.add_argument('--max_timesteps', action='store', type=int, help='Max_timesteps.',
                         default=500, required=False)
 
-    parser.add_argument('--camera_names', action='store', type=str, help='camera_names',
+    parser.add_argument('--camera_names', nargs='+', type=str, help='camera_names',
                         default=['cam_high', 'cam_left_wrist', 'cam_right_wrist'], required=False)
 
     #  topic name of color image
-    parser.add_argument('--img_front_topic', action='store', type=str, help='img_front_topic',
-                        default='/camera_f/color/image_raw', required=False)
+    parser.add_argument('--img_front_topic', action='store', type=str, help='img_front_topic (unused in current script)',
+                        default='/camera/front/color/image_raw', required=False)
     parser.add_argument('--img_left_topic', action='store', type=str, help='img_left_topic',
-                        default='/camera_l/color/image_raw', required=False)
+                        default='/camera/left/color/image_raw', required=False)
     parser.add_argument('--img_right_topic', action='store', type=str, help='img_right_topic',
-                        default='/camera_r/color/image_raw', required=False)
+                        default='/camera/right/color/image_raw', required=False)
     parser.add_argument('--img_top_topic', action='store', type=str, help='img_top_topic',
-                        default='/camera_t/color/image_raw', required=False)
+                        default='/camera/top/color/image_raw', required=False)
 
     # topic name of depth image
     parser.add_argument('--img_top_depth_topic', action='store', type=str, help='img_top_depth_topic',
-                        default='/camera_t/depth/image_raw', required=False)
-    parser.add_argument('--img_front_depth_topic', action='store', type=str, help='img_front_depth_topic',
-                        default='/camera_f/depth/image_raw', required=False)
+                        default='/camera/top/depth/image_rect_raw', required=False)
+    parser.add_argument('--img_front_depth_topic', action='store', type=str, help='img_front_depth_topic (unused in current script)',
+                        default='/camera/front/depth/image_rect_raw', required=False)
     parser.add_argument('--img_left_depth_topic', action='store', type=str, help='img_left_depth_topic',
-                        default='/camera_l/depth/image_raw', required=False)
+                        default='/camera/left/depth/image_rect_raw', required=False)
     parser.add_argument('--img_right_depth_topic', action='store', type=str, help='img_right_depth_topic',
-                        default='/camera_r/depth/image_raw', required=False)
+                        default='/camera/right/depth/image_rect_raw', required=False)
 
     # topic name of arm (left/right data)
     parser.add_argument('--joint_states_left_topic', action='store', type=str, help='joint_states_left_topic',
@@ -561,11 +598,11 @@ def get_arguments():
     parser.add_argument('--robot_base_topic', action='store', type=str, help='robot_base_topic',
                         default='/odom', required=False)
 
-    parser.add_argument('--use_robot_base', action='store', type=bool, help='use_robot_base',
+    parser.add_argument('--use_robot_base', action='store', type=str2bool, help='use_robot_base',
                         default=False, required=False)
 
     # collect depth image
-    parser.add_argument('--use_depth_image', action='store', type=bool, help='use_depth_image',
+    parser.add_argument('--use_depth_image', action='store', type=str2bool, help='use_depth_image',
                         default=False, required=False)
 
     parser.add_argument('--frame_rate', action='store', type=int, help='frame_rate',
@@ -581,25 +618,43 @@ def main():
     listener_thread.start()
 
     args = get_arguments()
+    rclpy.init(args=None)
     ros_operator = RosOperator(args)
-    timesteps, actions = ros_operator.process()
-    dataset_dir = os.path.join(args.dataset_dir, args.task_name)
+    executor = SingleThreadedExecutor()
+    executor.add_node(ros_operator)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
 
-    # if(len(actions) < args.max_timesteps):
-    #     print("\033[31m\nSave failure, please record %s timesteps of data.\033[0m\n" %args.max_timesteps)
-    #     exit(-1)
-    if not os.path.exists(dataset_dir):
-        os.makedirs(dataset_dir)
-    dataset_path = os.path.join(dataset_dir, "episode_" + str(args.episode_idx))
-    save_data(args, timesteps, actions, dataset_path)
-    listener_thread.join()
+    timesteps, actions = [], []
+    try:
+        timesteps, actions = ros_operator.process()
+        dataset_dir = os.path.join(args.dataset_dir, args.task_name)
+
+        # if(len(actions) < args.max_timesteps):
+        #     print("\033[31m\nSave failure, please record %s timesteps of data.\033[0m\n" %args.max_timesteps)
+        #     exit(-1)
+        if not os.path.exists(dataset_dir):
+            os.makedirs(dataset_dir)
+        dataset_path = os.path.join(dataset_dir, "episode_" + str(args.episode_idx))
+        save_data(args, timesteps, actions, dataset_path)
+    finally:
+        executor.shutdown()
+        ros_operator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin_thread.join(timeout=1.0)
+        listener_thread.join()
 
 
 if __name__ == '__main__':
     def signal_handler(sig, frame):
+        global saveData
         print("Signal received, shutting down!")
         print("remember to delete the uncompleted data!")
         print("\033[31m\nenter ESC to exit")
+        saveData = True
+        if rclpy.ok():
+            rclpy.shutdown()
         sys.exit(0)
 
 
