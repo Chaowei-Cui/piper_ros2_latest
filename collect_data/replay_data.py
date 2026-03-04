@@ -1,208 +1,274 @@
-#coding=utf-8
-import os
-import numpy as np
-import cv2
-import h5py
+# coding=utf-8
 import argparse
-import rospy
+import os
+import time
 
+import h5py
+import numpy as np
+import rclpy
 from cv_bridge import CvBridge
-from std_msgs.msg import Header
+from geometry_msgs.msg import Pose
+from piper_msgs.msg import PiperStatusMsg
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Image, JointState
-from geometry_msgs.msg import Twist
 
-import sys
-sys.path.append("./")
-def load_hdf5(dataset_dir, dataset_name):
-    dataset_path = os.path.join(dataset_dir, dataset_name + '.hdf5') 
+
+def load_hdf5(dataset_dir, task_name, episode_idx):
+    dataset_path = os.path.join(dataset_dir, task_name, f'episode_{episode_idx}.hdf5')
     if not os.path.isfile(dataset_path):
-        print(f'Dataset does not exist at \n{dataset_path}\n')
-        exit()
+        raise FileNotFoundError(f'Dataset does not exist: {dataset_path}')
 
+    data = {}
     with h5py.File(dataset_path, 'r') as root:
-        #is_sim = root.attrs['sim']
-        compressed = root.attrs.get('compress', False)
-        qpos = root['/observations/qpos'][()]
-        #qvel = root['/observations/qvel'][()]
-        qvel = 0
-        if 'effort' in root.keys():
-            effort = root['/observations/effort'][()]
+        data['timestamps'] = root['/timestamps'][()] if '/timestamps' in root else None
+
+        # RGB / Depth images
+        data['images'] = {}
+        data['images_depth'] = {}
+        for cam_name in root['/observations/images'].keys():
+            data['images'][cam_name] = root[f'/observations/images/{cam_name}'][()]
+        if '/observations/images_depth' in root:
+            for cam_name in root['/observations/images_depth'].keys():
+                data['images_depth'][cam_name] = root[f'/observations/images_depth/{cam_name}'][()]
+
+        # Arm datasets (new format)
+        if '/arm/joint_states_left/position' in root:
+            def _read_joint(prefix):
+                return {
+                    'position': root[f'/arm/{prefix}/position'][()],
+                    'velocity': root[f'/arm/{prefix}/velocity'][()],
+                    'effort': root[f'/arm/{prefix}/effort'][()],
+                }
+
+            data['joint_states_left'] = _read_joint('joint_states_left')
+            data['joint_states_right'] = _read_joint('joint_states_right')
+            data['joint_left'] = _read_joint('joint_left')
+            data['joint_right'] = _read_joint('joint_right')
+
+            data['end_pose_left'] = root['/arm/end_pose_left'][()]
+            data['end_pose_right'] = root['/arm/end_pose_right'][()]
+            data['arm_status_left'] = root['/arm/arm_status_left'][()]
+            data['arm_status_right'] = root['/arm/arm_status_right'][()]
         else:
-            effort = None
-        action = root['/action'][()]
-        action=qpos
-        #base_action = root['/base_action'][()]
-        base_action = 0
-        
-        image_dict = dict()
-        for cam_name in root[f'/observations/images/'].keys():
-            image_dict[cam_name] = root[f'/observations/images/{cam_name}'][()]
-        
-        if compressed:
-            compress_len = root['/compress_len'][()]
+            # Fallback for older files
+            qpos = root['/observations/qpos'][()]
+            qvel = root['/observations/qvel'][()] if '/observations/qvel' in root else np.zeros_like(qpos)
+            effort = root['/observations/effort'][()] if '/observations/effort' in root else np.zeros_like(qpos)
+            action = root['/action'][()] if '/action' in root else qpos
 
-    if compressed:
-        for cam_id, cam_name in enumerate(image_dict.keys()):
-            # un-pad and uncompress
-            padded_compressed_image_list = image_dict[cam_name]
-            image_list = []
-            for frame_id, padded_compressed_image in enumerate(padded_compressed_image_list): # [:1000] to save memory
-                image_len = int(compress_len[cam_id, frame_id])
-                
-                compressed_image = padded_compressed_image
-                image = cv2.imdecode(compressed_image, 1)
-                image_list.append(image)
-            image_dict[cam_name] = image_list
+            data['joint_states_left'] = {
+                'position': qpos[:, :7], 'velocity': qvel[:, :7], 'effort': effort[:, :7]
+            }
+            data['joint_states_right'] = {
+                'position': qpos[:, 7:14], 'velocity': qvel[:, 7:14], 'effort': effort[:, 7:14]
+            }
+            data['joint_left'] = {
+                'position': action[:, :7], 'velocity': np.zeros_like(action[:, :7]), 'effort': np.zeros_like(action[:, :7])
+            }
+            data['joint_right'] = {
+                'position': action[:, 7:14], 'velocity': np.zeros_like(action[:, 7:14]), 'effort': np.zeros_like(action[:, 7:14])
+            }
+            n = action.shape[0]
+            data['end_pose_left'] = np.zeros((n, 7), dtype=np.float32)
+            data['end_pose_right'] = np.zeros((n, 7), dtype=np.float32)
+            data['arm_status_left'] = np.zeros((n, 19), dtype=np.int64)
+            data['arm_status_right'] = np.zeros((n, 19), dtype=np.int64)
 
-    return qpos, qvel, effort, action, base_action, image_dict
+    return data, dataset_path
+
+
+class Ros2Replayer(Node):
+    def __init__(self, args):
+        super().__init__('replay_node_ros2')
+        self.args = args
+        self.bridge = CvBridge()
+
+        sensor_qos = qos_profile_sensor_data
+        default_qos = QoSProfile(depth=10)
+
+        # RGB
+        self.pub_rgb_left = self.create_publisher(Image, args.img_left_topic, sensor_qos)
+        self.pub_rgb_right = self.create_publisher(Image, args.img_right_topic, sensor_qos)
+        self.pub_rgb_top = self.create_publisher(Image, args.img_top_topic, sensor_qos)
+
+        # Depth
+        self.pub_depth_left = self.create_publisher(Image, args.img_left_depth_topic, sensor_qos)
+        self.pub_depth_right = self.create_publisher(Image, args.img_right_depth_topic, sensor_qos)
+        self.pub_depth_top = self.create_publisher(Image, args.img_top_depth_topic, sensor_qos)
+
+        # Arm topics
+        self.pub_joint_states_left = self.create_publisher(JointState, args.joint_states_left_topic, default_qos)
+        self.pub_joint_states_right = self.create_publisher(JointState, args.joint_states_right_topic, default_qos)
+        self.pub_joint_left = self.create_publisher(JointState, args.joint_left_topic, default_qos)
+        self.pub_joint_right = self.create_publisher(JointState, args.joint_right_topic, default_qos)
+
+        self.pub_end_pose_left = self.create_publisher(Pose, args.end_pose_left_topic, default_qos)
+        self.pub_end_pose_right = self.create_publisher(Pose, args.end_pose_right_topic, default_qos)
+
+        self.pub_arm_status_left = self.create_publisher(PiperStatusMsg, args.arm_status_left_topic, default_qos)
+        self.pub_arm_status_right = self.create_publisher(PiperStatusMsg, args.arm_status_right_topic, default_qos)
+
+    def _build_joint_msg(self, position, velocity, effort):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = [f'joint{i}' for i in range(7)]
+        msg.position = position.tolist()
+        msg.velocity = velocity.tolist()
+        msg.effort = effort.tolist()
+        return msg
+
+    @staticmethod
+    def _build_pose_msg(vec7):
+        msg = Pose()
+        msg.position.x = float(vec7[0])
+        msg.position.y = float(vec7[1])
+        msg.position.z = float(vec7[2])
+        msg.orientation.x = float(vec7[3])
+        msg.orientation.y = float(vec7[4])
+        msg.orientation.z = float(vec7[5])
+        msg.orientation.w = float(vec7[6])
+        return msg
+
+    @staticmethod
+    def _build_status_msg(vec19):
+        msg = PiperStatusMsg()
+        msg.ctrl_mode = int(vec19[0])
+        msg.arm_status = int(vec19[1])
+        msg.mode_feedback = int(vec19[2])
+        msg.teach_status = int(vec19[3])
+        msg.motion_status = int(vec19[4])
+        msg.trajectory_num = int(vec19[5])
+        msg.err_code = int(vec19[6])
+        msg.joint_1_angle_limit = bool(vec19[7])
+        msg.joint_2_angle_limit = bool(vec19[8])
+        msg.joint_3_angle_limit = bool(vec19[9])
+        msg.joint_4_angle_limit = bool(vec19[10])
+        msg.joint_5_angle_limit = bool(vec19[11])
+        msg.joint_6_angle_limit = bool(vec19[12])
+        msg.communication_status_joint_1 = bool(vec19[13])
+        msg.communication_status_joint_2 = bool(vec19[14])
+        msg.communication_status_joint_3 = bool(vec19[15])
+        msg.communication_status_joint_4 = bool(vec19[16])
+        msg.communication_status_joint_5 = bool(vec19[17])
+        msg.communication_status_joint_6 = bool(vec19[18])
+        return msg
+
+    def replay(self, data):
+        cam_top, cam_left, cam_right = self.args.camera_names
+        for cam_name in [cam_top, cam_left, cam_right]:
+            if cam_name not in data['images']:
+                raise RuntimeError(f'Missing RGB camera stream in hdf5: {cam_name}')
+
+        total = data['joint_left']['position'].shape[0]
+        print(f'Replay frames: {total}')
+
+        prev_ts = None
+        for i in range(total):
+            if not rclpy.ok():
+                break
+
+            # Publish RGB
+            self.pub_rgb_top.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_top][i], encoding='bgr8'))
+            self.pub_rgb_left.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_left][i], encoding='bgr8'))
+            self.pub_rgb_right.publish(self.bridge.cv2_to_imgmsg(data['images'][cam_right][i], encoding='bgr8'))
+
+            # Publish Depth (if present)
+            if all(cam in data['images_depth'] for cam in [cam_top, cam_left, cam_right]):
+                self.pub_depth_top.publish(self.bridge.cv2_to_imgmsg(data['images_depth'][cam_top][i], encoding='passthrough'))
+                self.pub_depth_left.publish(self.bridge.cv2_to_imgmsg(data['images_depth'][cam_left][i], encoding='passthrough'))
+                self.pub_depth_right.publish(self.bridge.cv2_to_imgmsg(data['images_depth'][cam_right][i], encoding='passthrough'))
+
+            # Publish joints
+            self.pub_joint_states_left.publish(
+                self._build_joint_msg(
+                    data['joint_states_left']['position'][i],
+                    data['joint_states_left']['velocity'][i],
+                    data['joint_states_left']['effort'][i],
+                )
+            )
+            self.pub_joint_states_right.publish(
+                self._build_joint_msg(
+                    data['joint_states_right']['position'][i],
+                    data['joint_states_right']['velocity'][i],
+                    data['joint_states_right']['effort'][i],
+                )
+            )
+            self.pub_joint_left.publish(
+                self._build_joint_msg(
+                    data['joint_left']['position'][i],
+                    data['joint_left']['velocity'][i],
+                    data['joint_left']['effort'][i],
+                )
+            )
+            self.pub_joint_right.publish(
+                self._build_joint_msg(
+                    data['joint_right']['position'][i],
+                    data['joint_right']['velocity'][i],
+                    data['joint_right']['effort'][i],
+                )
+            )
+
+            # Publish end poses and arm status
+            self.pub_end_pose_left.publish(self._build_pose_msg(data['end_pose_left'][i]))
+            self.pub_end_pose_right.publish(self._build_pose_msg(data['end_pose_right'][i]))
+            self.pub_arm_status_left.publish(self._build_status_msg(data['arm_status_left'][i]))
+            self.pub_arm_status_right.publish(self._build_status_msg(data['arm_status_right'][i]))
+
+            # Replay timing
+            if self.args.use_saved_timestamps and data['timestamps'] is not None:
+                cur_ts = float(data['timestamps'][i])
+                if prev_ts is not None:
+                    dt = max(0.0, min(cur_ts - prev_ts, self.args.max_sleep_s))
+                    time.sleep(dt)
+                prev_ts = cur_ts
+            else:
+                if self.args.frame_rate > 0:
+                    time.sleep(1.0 / self.args.frame_rate)
+
+            if i % 50 == 0:
+                print(f'Replay {i}/{total}')
+
 
 def main(args):
-    rospy.init_node("replay_node")
-    bridge = CvBridge()
-    img_left_publisher = rospy.Publisher(args.img_left_topic, Image, queue_size=10)
-    img_right_publisher = rospy.Publisher(args.img_right_topic, Image, queue_size=10)
-    img_front_publisher = rospy.Publisher(args.img_front_topic, Image, queue_size=10)
-    
-    puppet_arm_left_publisher = rospy.Publisher(args.puppet_arm_left_topic, JointState, queue_size=10)
-    puppet_arm_right_publisher = rospy.Publisher(args.puppet_arm_right_topic, JointState, queue_size=10)
-    
-    master_arm_left_publisher = rospy.Publisher(args.master_arm_left_topic, JointState, queue_size=10)
-    master_arm_right_publisher = rospy.Publisher(args.master_arm_right_topic, JointState, queue_size=10)
-    
-    robot_base_publisher = rospy.Publisher(args.robot_base_topic, Twist, queue_size=10)
+    data, path = load_hdf5(args.dataset_dir, args.task_name, args.episode_idx)
+    print(f'Loaded: {path}')
 
-
-    dataset_dir = args.dataset_dir
-    episode_idx = args.episode_idx
-    task_name   = args.task_name
-    dataset_name = f'episode_{episode_idx}'
-    # dataset_name = f'episode{episode_idx}'
-
-    origin_left = [-0.0057,-0.031, -0.0122, -0.032, 0.0099, 0.0179, 0.2279]  
-    origin_right = [ 0.0616, 0.0021, 0.0475, -0.1013, 0.1097, 0.0872, 0.2279]
-
-    
-    joint_state_msg = JointState()
-    joint_state_msg.header =  Header()
-    joint_state_msg.name = ['joint0', 'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']  # 设置关节名称
-    twist_msg = Twist()
-
-    rate = rospy.Rate(args.frame_rate)
-    
-    qposs, qvels, efforts, actions, base_actions, image_dicts = load_hdf5(os.path.join(dataset_dir, task_name), dataset_name)
-    actions=qposs
-
-
-
-    if args.only_pub_master:
-        last_action = [-0.0057,-0.031, -0.0122, -0.032, 0.0099, 0.0179, 0.2279, 0.0616, 0.0021, 0.0475, -0.1013, 0.1097, 0.0872, 0.2279]
-        rate = rospy.Rate(100)
-        for action in actions:
-            if(rospy.is_shutdown()):
-                    break
-            
-            new_actions = np.linspace(last_action, action, 20) # 插值
-            last_action = action
-            for act in new_actions:
-                print(np.round(act[:7], 4))
-                cur_timestamp = rospy.Time.now()  # 设置时间戳
-                joint_state_msg.header.stamp = cur_timestamp 
-                
-                joint_state_msg.position = act[:7]
-                master_arm_left_publisher.publish(joint_state_msg)
-
-                joint_state_msg.position = act[7:]
-                master_arm_right_publisher.publish(joint_state_msg)   
-
-                if(rospy.is_shutdown()):
-                    break
-                rate.sleep() 
-    
-    else:
-        i = 0
-        while(not rospy.is_shutdown() and i < len(actions)):
-            print("left: ", np.round(qposs[i][:7], 4), " right: ", np.round(qposs[i][7:], 4))
-            print("task ", dataset_dir + task_name + dataset_name)
-            
-            cam_names = [k for k in image_dicts.keys()]
-            image0 = image_dicts[cam_names[0]][i] 
-            image0 = image0[:, :, [2, 1, 0]]  # swap B and R channel
-        
-            image1 = image_dicts[cam_names[1]][i] 
-            image1 = image1[:, :, [2, 1, 0]]  # swap B and R channel
-            
-            image2 = image_dicts[cam_names[2]][i] 
-            image2 = image2[:, :, [2, 1, 0]]  # swap B and R channel
-
-            cur_timestamp = rospy.Time.now()  # 设置时间戳
-            
-            joint_state_msg.header.stamp = cur_timestamp 
-            joint_state_msg.position = actions[i][:7]
-            master_arm_left_publisher.publish(joint_state_msg)
-
-            joint_state_msg.position = actions[i][7:]
-            master_arm_right_publisher.publish(joint_state_msg)
-
-            joint_state_msg.position = qposs[i][:7]
-            puppet_arm_left_publisher.publish(joint_state_msg)
-
-            joint_state_msg.position = qposs[i][7:]
-            puppet_arm_right_publisher.publish(joint_state_msg)
-
-            img_front_publisher.publish(bridge.cv2_to_imgmsg(image0, "bgr8"))
-            img_left_publisher.publish(bridge.cv2_to_imgmsg(image1, "bgr8"))
-            img_right_publisher.publish(bridge.cv2_to_imgmsg(image2, "bgr8"))
-    
-            
-            #twist_msg.linear.x = base_actions[i][0]
-            #twist_msg.angular.z = base_actions[i][1]
-            #robot_base_publisher.publish(twist_msg)
-
-            i += 1
-            rate.sleep() 
-            
+    rclpy.init(args=None)
+    node = Ros2Replayer(args)
+    try:
+        node.replay(data)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_dir', action='store', type=str, help='Dataset dir.', required=True)
-    parser.add_argument('--task_name', action='store', type=str, help='Task name.',
-                        default="aloha_mobile_dummy", required=False)
+    parser.add_argument('--dataset_dir', type=str, required=True, help='Dataset root dir')
+    parser.add_argument('--task_name', type=str, default='aloha_mobile_dummy')
+    parser.add_argument('--episode_idx', type=int, default=0)
 
-    parser.add_argument('--episode_idx', action='store', type=int, help='Episode index.',default=0, required=False)
-    
-    parser.add_argument('--camera_names', action='store', type=str, help='camera_names',
-                        default=['cam_high', 'cam_left_wrist', 'cam_right_wrist'], required=False)
-    
-    parser.add_argument('--img_front_topic', action='store', type=str, help='img_front_topic',
-                        default='/camera_f/color/image_raw', required=False)
-    parser.add_argument('--img_left_topic', action='store', type=str, help='img_left_topic',
-                        default='/camera_l/color/image_raw', required=False)
-    parser.add_argument('--img_right_topic', action='store', type=str, help='img_right_topic',
-                        default='/camera_r/color/image_raw', required=False)
-    
-    parser.add_argument('--master_arm_left_topic', action='store', type=str, help='master_arm_left_topic',
-                        default='/master/joint_left', required=False)
-    parser.add_argument('--master_arm_right_topic', action='store', type=str, help='master_arm_right_topic',
-                        default='/master/joint_right', required=False)
-    
-    parser.add_argument('--puppet_arm_left_topic', action='store', type=str, help='puppet_arm_left_topic',
-                        default='/puppet/joint_left', required=False)
-    parser.add_argument('--puppet_arm_right_topic', action='store', type=str, help='puppet_arm_right_topic',
-                        default='/puppet/joint_right', required=False)
-    
-    parser.add_argument('--robot_base_topic', action='store', type=str, help='robot_base_topic',
-                        default='/cmd_vel', required=False)
-    parser.add_argument('--use_robot_base', action='store', type=bool, help='use_robot_base',
-                        default=False, required=False)
-    
-    parser.add_argument('--frame_rate', action='store', type=int, help='frame_rate',
-                        default=30, required=False)
-    
-    parser.add_argument('--only_pub_master', action='store_true', help='only_pub_master',required=False)
-    
-    
+    parser.add_argument('--frame_rate', type=int, default=30)
+    parser.add_argument('--use_saved_timestamps', action='store_true')
+    parser.add_argument('--max_sleep_s', type=float, default=0.2)
+    parser.add_argument('--camera_names', nargs=3, default=['cam_high', 'cam_left_wrist', 'cam_right_wrist'])
 
-    args = parser.parse_args()
-    main(args)
-    # python collect_data.py --max_timesteps 500 --is_compress --episode_idx 0 
+    parser.add_argument('--img_left_topic', type=str, default='/camera/left/color/image_raw')
+    parser.add_argument('--img_right_topic', type=str, default='/camera/right/color/image_raw')
+    parser.add_argument('--img_top_topic', type=str, default='/camera/top/color/image_raw')
+
+    parser.add_argument('--img_left_depth_topic', type=str, default='/camera/left/depth/image_rect_raw')
+    parser.add_argument('--img_right_depth_topic', type=str, default='/camera/right/depth/image_rect_raw')
+    parser.add_argument('--img_top_depth_topic', type=str, default='/camera/top/depth/image_rect_raw')
+
+    parser.add_argument('--joint_states_left_topic', type=str, default='/joint_states_left')
+    parser.add_argument('--joint_states_right_topic', type=str, default='/joint_states_right')
+    parser.add_argument('--joint_left_topic', type=str, default='/joint_left')
+    parser.add_argument('--joint_right_topic', type=str, default='/joint_right')
+    parser.add_argument('--end_pose_left_topic', type=str, default='/end_pose_left')
+    parser.add_argument('--end_pose_right_topic', type=str, default='/end_pose_right')
+    parser.add_argument('--arm_status_left_topic', type=str, default='/arm_status_left')
+    parser.add_argument('--arm_status_right_topic', type=str, default='/arm_status_right')
+
+    main(parser.parse_args())
