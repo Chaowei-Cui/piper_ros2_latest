@@ -7,6 +7,8 @@ TASK_NAME="123"
 MAX_STEPS=4000
 FRAME_RATE=30
 LANGUAGE_RAW="Do folds on the shorts."
+PRINT_DATA_INFO=1
+PRINT_EVERY_N=1
 
 cd collect_data
 
@@ -23,21 +25,24 @@ fi
 
 next_num=$((max_num + 1))
 
-python3 collect_data.py \
+PRINT_ARGS=()
+if [ "$PRINT_DATA_INFO" = "1" ]; then
+    PRINT_ARGS+=(--print_data_info)
+fi
+
+python3 collect_data_ros1.py \
     --dataset_dir "$DATASET_DIR" \
     --task_name "$TASK_NAME" \
     --max_timesteps "$MAX_STEPS" \
     --frame_rate "$FRAME_RATE" \
     --episode_idx "$next_num" \
     --language_raw "$LANGUAGE_RAW" \
+    --print_every_n "$PRINT_EVERY_N" \
+    "${PRINT_ARGS[@]}" \
     --joint_states_left_topic /joint_states_left \
     --joint_states_right_topic /joint_states_right \
-    --joint_left_topic /joint_left \
-    --joint_right_topic /joint_right \
     --end_pose_left_topic /end_pose_left \
     --end_pose_right_topic /end_pose_right \
-    --arm_status_left_topic /arm_status_left \
-    --arm_status_right_topic /arm_status_right \
     --img_left_topic /camera/left/color/image_raw \
     --img_right_topic /camera/right/color/image_raw \
     --img_top_topic /camera/top/color/image_raw \

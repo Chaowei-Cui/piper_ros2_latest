@@ -1,0 +1,13 @@
+# 收数据
+bash start_robot.sh
+bash camera.sh
+bash collect.sh
+
+
+# 回放
+bash eval.sh
+bash replay.sh eef
+bash replay.sh joint
+
+# 查看数据
+bash 

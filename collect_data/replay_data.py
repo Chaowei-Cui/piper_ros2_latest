@@ -8,7 +8,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose
-from piper_msgs.msg import PiperStatusMsg, PosCmd
+from piper_msgs.msg import PosCmd
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Image, JointState
@@ -43,15 +43,44 @@ def load_hdf5(dataset_dir, task_name, episode_idx):
 
             data['joint_states_left'] = _read_joint('joint_states_left')
             data['joint_states_right'] = _read_joint('joint_states_right')
-            data['joint_left'] = _read_joint('joint_left')
-            data['joint_right'] = _read_joint('joint_right')
 
-            data['end_pose_left'] = root['/arm/end_pose_left'][()]
-            data['end_pose_right'] = root['/arm/end_pose_right'][()]
-            data['arm_status_left'] = root['/arm/arm_status_left'][()]
-            data['arm_status_right'] = root['/arm/arm_status_right'][()]
+            if '/arm/joint_left/position' in root and '/arm/joint_right/position' in root:
+                data['joint_left'] = _read_joint('joint_left')
+                data['joint_right'] = _read_joint('joint_right')
+            else:
+                # Compatibility: some datasets only keep joint_states + /action.
+                action = root['/action'][()] if '/action' in root else None
+                left_pos = data['joint_states_left']['position']
+                right_pos = data['joint_states_right']['position']
+                if action is not None:
+                    split = action.shape[1] // 2
+                    left_cmd = action[:, :split]
+                    right_cmd = action[:, split:]
+                else:
+                    left_cmd = left_pos
+                    right_cmd = right_pos
+                data['joint_left'] = {
+                    'position': left_cmd,
+                    'velocity': np.zeros_like(left_cmd),
+                    'effort': np.zeros_like(left_cmd),
+                }
+                data['joint_right'] = {
+                    'position': right_cmd,
+                    'velocity': np.zeros_like(right_cmd),
+                    'effort': np.zeros_like(right_cmd),
+                }
+
+            n = data['joint_left']['position'].shape[0]
+            if '/arm/end_pose_left' in root and '/arm/end_pose_right' in root:
+                data['end_pose_left'] = root['/arm/end_pose_left'][()]
+                data['end_pose_right'] = root['/arm/end_pose_right'][()]
+            else:
+                data['end_pose_left'] = np.zeros((n, 7), dtype=np.float32)
+                data['end_pose_right'] = np.zeros((n, 7), dtype=np.float32)
+
         else:
             # Fallback for older files
+            print('Using fallback dataset loader (legacy joint layout).')
             qpos = root['/observations/qpos'][()]
             qvel = root['/observations/qvel'][()] if '/observations/qvel' in root else np.zeros_like(qpos)
             effort = root['/observations/effort'][()] if '/observations/effort' in root else np.zeros_like(qpos)
@@ -72,10 +101,12 @@ def load_hdf5(dataset_dir, task_name, episode_idx):
                 'position': action[:, a_split:], 'velocity': np.zeros_like(action[:, a_split:]), 'effort': np.zeros_like(action[:, a_split:])
             }
             n = action.shape[0]
-            data['end_pose_left'] = np.zeros((n, 7), dtype=np.float32)
-            data['end_pose_right'] = np.zeros((n, 7), dtype=np.float32)
-            data['arm_status_left'] = np.zeros((n, 19), dtype=np.int64)
-            data['arm_status_right'] = np.zeros((n, 19), dtype=np.int64)
+            if '/arm/end_pose_left' in root and '/arm/end_pose_right' in root:
+                data['end_pose_left'] = root['/arm/end_pose_left'][()]
+                data['end_pose_right'] = root['/arm/end_pose_right'][()]
+            else:
+                data['end_pose_left'] = np.zeros((n, 7), dtype=np.float32)
+                data['end_pose_right'] = np.zeros((n, 7), dtype=np.float32)
 
     return data, dataset_path
 
@@ -111,9 +142,6 @@ class Ros2Replayer(Node):
         self.pub_end_pose_right = self.create_publisher(Pose, args.end_pose_right_topic, default_qos)
         self.pub_pos_cmd_left = self.create_publisher(PosCmd, args.pos_cmd_left_topic, default_qos)
         self.pub_pos_cmd_right = self.create_publisher(PosCmd, args.pos_cmd_right_topic, default_qos)
-
-        self.pub_arm_status_left = self.create_publisher(PiperStatusMsg, args.arm_status_left_topic, default_qos)
-        self.pub_arm_status_right = self.create_publisher(PiperStatusMsg, args.arm_status_right_topic, default_qos)
 
     @staticmethod
     def _align_vec_len(vec, target_len):
@@ -151,30 +179,6 @@ class Ros2Replayer(Node):
         return msg
 
     @staticmethod
-    def _build_status_msg(vec19):
-        msg = PiperStatusMsg()
-        msg.ctrl_mode = int(vec19[0])
-        msg.arm_status = int(vec19[1])
-        msg.mode_feedback = int(vec19[2])
-        msg.teach_status = int(vec19[3])
-        msg.motion_status = int(vec19[4])
-        msg.trajectory_num = int(vec19[5])
-        msg.err_code = int(vec19[6])
-        msg.joint_1_angle_limit = bool(vec19[7])
-        msg.joint_2_angle_limit = bool(vec19[8])
-        msg.joint_3_angle_limit = bool(vec19[9])
-        msg.joint_4_angle_limit = bool(vec19[10])
-        msg.joint_5_angle_limit = bool(vec19[11])
-        msg.joint_6_angle_limit = bool(vec19[12])
-        msg.communication_status_joint_1 = bool(vec19[13])
-        msg.communication_status_joint_2 = bool(vec19[14])
-        msg.communication_status_joint_3 = bool(vec19[15])
-        msg.communication_status_joint_4 = bool(vec19[16])
-        msg.communication_status_joint_5 = bool(vec19[17])
-        msg.communication_status_joint_6 = bool(vec19[18])
-        return msg
-
-    @staticmethod
     def _quat_to_rpy(qx, qy, qz, qw):
         # Quaternion (x, y, z, w) -> Euler (roll, pitch, yaw), radians.
         sinr_cosp = 2.0 * (qw * qx + qy * qz)
@@ -207,6 +211,11 @@ class Ros2Replayer(Node):
         msg.mode1 = int(mode1)
         msg.mode2 = int(mode2)
         return msg
+
+    @staticmethod
+    def _fmt_vec(vec, precision=4):
+        arr = np.asarray(vec, dtype=np.float64)
+        return np.array2string(arr, precision=precision, separator=', ', suppress_small=False)
 
     def replay(self, data):
         cam_top, cam_left, cam_right = self.args.camera_names
@@ -278,11 +287,9 @@ class Ros2Replayer(Node):
                 )
             )
 
-            # Publish end poses and arm status
+            # Publish end poses
             self.pub_end_pose_left.publish(self._build_pose_msg(data['end_pose_left'][i]))
             self.pub_end_pose_right.publish(self._build_pose_msg(data['end_pose_right'][i]))
-            self.pub_arm_status_left.publish(self._build_status_msg(data['arm_status_left'][i]))
-            self.pub_arm_status_right.publish(self._build_status_msg(data['arm_status_right'][i]))
             left_pos = data['joint_left']['position'][i]
             right_pos = data['joint_right']['position'][i]
             left_gripper = float(left_pos[6]) if len(left_pos) > 6 else (float(left_pos[-1]) if len(left_pos) > 0 else 0.0)
@@ -304,6 +311,15 @@ class Ros2Replayer(Node):
                 )
             )
 
+            if self.args.print_data_info and (i % self.args.print_every_n == 0 or i == total - 1):
+                print(
+                    f"[frame {i}/{total}] "
+                    f"joint_left={self._fmt_vec(left_pos)} "
+                    f"joint_right={self._fmt_vec(right_pos)} "
+                    f"end_pose_left={self._fmt_vec(data['end_pose_left'][i])} "
+                    f"end_pose_right={self._fmt_vec(data['end_pose_right'][i])}"
+                )
+
             # Replay timing
             if self.args.use_saved_timestamps and data['timestamps'] is not None:
                 cur_ts = float(data['timestamps'][i])
@@ -315,8 +331,9 @@ class Ros2Replayer(Node):
                 if self.args.frame_rate > 0:
                     time.sleep(1.0 / self.args.frame_rate)
 
-            if i % 50 == 0:
-                print(f'Replay {i}/{total}')
+            # if i % 50 == 0:
+            #     print(f'Replay {i}/{total}')
+            print(f'Replay {i}/{total}')
 
 
 def main(args):
@@ -363,7 +380,9 @@ if __name__ == '__main__':
     parser.add_argument('--pos_cmd_right_topic', type=str, default='/pos_cmd_right')
     parser.add_argument('--pos_cmd_mode1', type=int, default=0)
     parser.add_argument('--pos_cmd_mode2', type=int, default=0)
-    parser.add_argument('--arm_status_left_topic', type=str, default='/arm_status_left')
-    parser.add_argument('--arm_status_right_topic', type=str, default='/arm_status_right')
+    parser.add_argument('--print_data_info', action='store_true', help='Print replayed joint/end-pose data.')
+    parser.add_argument('--print_every_n', type=int, default=1, help='Print data info every N frames.')
 
-    main(parser.parse_args())
+    args = parser.parse_args()
+    args.print_every_n = max(1, int(args.print_every_n))
+    main(args)
